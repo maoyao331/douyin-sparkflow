@@ -150,6 +150,46 @@ python main.py --web
 
 </details>
 
+### ⚡ 中文菜单一键快捷安装
+
+项目提供中文菜单式快捷脚本，支持服务器安装和 Windows 本地安装。脚本会复用项目现有安装流程，不会替代核心 Docker Compose 配置。
+
+#### Linux 服务器一键运行
+
+在服务器终端执行以下命令，脚本会自动下载快捷菜单并启动：
+
+```bash
+curl -fL https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-install.sh -o quick-install.sh && chmod 700 quick-install.sh && bash quick-install.sh
+```
+
+选择“服务器安装”后，可设置 Web 端口，直接回车默认使用 `8787`。如果不填写域名，访问地址为 `http://服务器IP:端口`；如果填写域名，脚本会让 SparkFlow Web 仅监听本机，并安装 Nginx 使用 80 端口转发，之后访问 `http://你的域名`，不需要再输入端口。请先在 Cloudflare 添加指向服务器 IP 的 `A` 记录。若开启小黄云，HTTPS 和 443 入口需要单独规划；脚本不会修改现有 Xray 的 443。
+
+#### Windows 本地一键运行
+
+在 PowerShell 中执行以下命令：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+irm https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-install.ps1 -OutFile quick-install.ps1
+.\\quick-install.ps1
+```
+
+选择“Windows 本地安装”后，直接回车默认使用 `8787`。Windows 本地模式使用局域网 IP 加端口访问，例如 `http://192.168.1.100:8787`；访问设备和 Windows 电脑需要处于同一局域网，并且 Windows 防火墙需要允许该端口。Windows 模式不配置公网域名。
+
+#### 菜单结构
+
+```text
+一：服务器安装
+  1：添加端口（回车默认 8787）
+  2：添加域名（回车默认使用 IP 加端口）
+  3：返回上一级
+二：Windows 本地安装
+  1：添加端口（回车默认 8787）
+  2：局域网 IP 加端口访问
+  3：返回上一级
+三：退出脚本
+```
+
 ### 🎬 使用流程
 
 1. **登录账号** → 进入"登录工作区"，扫码登录抖音账号
