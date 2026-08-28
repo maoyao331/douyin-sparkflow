@@ -230,12 +230,45 @@ windows_menu() {
   done
 }
 
+uninstall_server() {
+  local confirm compose_root
+  printf '\n此操作将删除 SparkFlow 容器、镜像、项目目录、运行状态、日志、代理配置和本脚本。\n'
+  printf '如果使用本脚本配置过域名，也会删除 douyin-sparkflow-* 的 Nginx 配置。\n'
+  printf '不会删除 Docker、Nginx 软件本身，也不会修改 3x-ui/Xray 或 443。\n\n'
+  read -r -p '请输入 DELETE 确认卸载：' confirm
+  if [[ "$confirm" != "DELETE" ]]; then
+    printf '未输入 DELETE，已取消卸载。\n'
+    return 0
+  fi
+
+  compose_root="/opt/douyin-sparkflow"
+  if [[ -f "$compose_root/docker-compose.yml" ]] && command -v docker >/dev/null 2>&1; then
+    docker compose -f "$compose_root/docker-compose.yml" down --remove-orphans --volumes || true
+  fi
+  for container in mihomo douyin-web login-desktop douyin-scheduler douyin-task; do
+    docker rm -f "$container" >/dev/null 2>&1 || true
+  done
+  docker image rm -f douyin-sparkflow:local >/dev/null 2>&1 || true
+  docker network rm douyin-sparkflow_default >/dev/null 2>&1 || true
+
+  if [[ -d /etc/nginx/sites-enabled ]] && compgen -G '/etc/nginx/sites-enabled/douyin-sparkflow-*' >/dev/null; then
+    rm -f /etc/nginx/sites-enabled/douyin-sparkflow-* /etc/nginx/sites-available/douyin-sparkflow-*
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+  fi
+  rm -rf -- "$compose_root"
+  rm -f -- "$SCRIPT_DIR/quick-install.sh"
+  printf '\nSparkFlow 卸载完成；8787、8788、7890、9090 容器端口已释放。\n'
+  printf 'Docker、Nginx、3x-ui/Xray 和 443 未被删除或修改。\n'
+  exit 0
+}
+
 main_menu() {
   while true; do
     print_header
-    printf '1：服务器安装\n'
-    printf '2：Windows 本地安装\n'
-    printf '3：退出脚本\n\n'
+    printf '一：服务器安装\n'
+    printf '二：Windows 本地安装\n'
+    printf '三：退出脚本\n'
+    printf '四：卸载脚本\n\n'
     read -r -p '请选择：' choice
     case "$choice" in
       1) server_menu ;;
@@ -244,6 +277,7 @@ main_menu() {
         printf '已退出。\n'
         return 0
         ;;
+      4) uninstall_server ;;
       *) printf '选项无效。\n'; sleep 1 ;;
     esac
   done
