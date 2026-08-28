@@ -106,6 +106,33 @@ function Run-LocalInstall([int]$Port) {
 
 Ensure-ProjectSource
 
+function Uninstall-Local {
+    Write-Host ""
+    Write-Host "此操作将删除 SparkFlow 容器、镜像、网络、项目文件和本地运行数据。" -ForegroundColor Yellow
+    Write-Host "不会卸载 Docker Desktop，也不会删除其他 Docker 项目。"
+    $confirm = Read-Host "请输入 DELETE 确认卸载"
+    if ($confirm -cne "DELETE") {
+        Write-Host "未输入 DELETE，已取消卸载。"
+        return
+    }
+    if (Get-Command docker -ErrorAction SilentlyContinue) {
+        $compose = Join-Path $repoRoot "docker-compose.yml"
+        if (Test-Path $compose) { docker compose -f $compose down --remove-orphans --volumes }
+        foreach ($container in @("mihomo", "douyin-web", "login-desktop", "douyin-scheduler", "douyin-task")) {
+            docker rm -f $container 2>$null
+        }
+        docker image rm -f douyin-sparkflow:local 2>$null
+        docker network rm douyin-sparkflow_default 2>$null
+    }
+    if ((Test-Path (Join-Path $repoRoot "docker-compose.yml")) -and ($repoRoot -ne (Get-Path ".").Path)) {
+        Remove-Item -Recurse -Force $repoRoot
+    } else {
+        Write-Host "项目目录与当前目录相同，已清理 Docker 资源；为避免误删其他文件，项目文件未自动删除。"
+    }
+    Write-Host "SparkFlow 卸载完成；不会修改其他 Docker 项目。"
+    exit 0
+}
+
 function Server-Menu {
     while ($true) {
         Clear-Host
@@ -148,11 +175,13 @@ while ($true) {
     Write-Host "一：服务器安装"
     Write-Host "二：Windows 本地安装"
     Write-Host "三：退出脚本"
+    Write-Host "四：卸载脚本"
     $choice = Read-Host "请选择"
     switch ($choice) {
         "1" { Server-Menu }
         "2" { Windows-Menu }
         "3" { Write-Host "已退出。"; exit 0 }
+        "4" { Uninstall-Local }
         default { Write-Host "选项无效。" -ForegroundColor Yellow; Start-Sleep -Seconds 1 }
     }
 }

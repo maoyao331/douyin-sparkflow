@@ -176,6 +176,12 @@ irm https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-inst
 
 选择“Windows 本地安装”后，直接回车默认使用 `8787`。Windows 本地模式使用局域网 IP 加端口访问，例如 `http://192.168.1.100:8787`；访问设备和 Windows 电脑需要处于同一局域网，并且 Windows 防火墙需要允许该端口。Windows 模式不配置公网域名。
 
+#### 卸载说明
+
+在快捷脚本主菜单选择“**四：卸载脚本**”，输入大写 `DELETE` 进行二次确认。服务器模式会停止并删除 SparkFlow 自身的 Docker 容器、相关镜像、网络、`/opt/douyin-sparkflow` 项目目录、运行状态、日志和代理配置；如果此前由快捷脚本创建了 Nginx 域名配置，也会一并删除。Windows 模式会停止并删除 SparkFlow 自身的容器、镜像、网络和项目文件，但不会卸载 Docker Desktop，也不会删除其他 Docker 项目。
+
+卸载不会删除 Docker 或 Nginx 软件，不会修改 3x-ui/Xray，不会停止其他容器，也不会修改 443 端口。卸载前请确认不再需要 `state/`、登录态、Cookie、账号数据和日志；这些运行时文件删除后不能通过脚本恢复。
+
 #### 菜单结构
 
 ```text
@@ -188,6 +194,7 @@ irm https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-inst
   2：局域网 IP 加端口访问
   3：返回上一级
 三：退出脚本
+四：卸载脚本
 ```
 
 ### 🎬 使用流程
