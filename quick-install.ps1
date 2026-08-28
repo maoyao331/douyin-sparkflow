@@ -54,29 +54,26 @@ function Get-PublicIp {
     try { return (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 5) } catch { return "服务器公网IP" }
 }
 
-function Configure-Access([int]$Port) {
-    $domain = Read-Host "请输入域名（回车使用服务器 IP 访问）"
-    if ([string]::IsNullOrWhiteSpace($domain)) {
-        Write-Host "将使用 IP:$Port 访问。"
-        return
-    }
-    $domain = $domain.Trim().ToLowerInvariant()
-    if (-not (Test-Domain $domain)) {
-        Write-Host "域名格式无效，请使用类似 spark.example.com 的完整域名。" -ForegroundColor Yellow
-        return $false
-    }
-    $ip = Get-PublicIp
-    Write-Host "请在 Cloudflare DNS 中添加：类型 A，名称 $domain，IPv4 $ip。"
-    Write-Host "请保持关闭小黄云，使用仅 DNS（灰云）；本脚本不会自动修改 Cloudflare。"
-    Write-Host "域名访问地址：http://${domain}:$Port（灰云 A 记录）"
-    return $true
+function Get-LanIp {
+    $ip = Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
+        Select-Object -First 1 -ExpandProperty IPAddress
+    if ($ip) { return $ip }
+    return "本机局域网IP"
+}
+
+function Show-LocalAccess([int]$Port) {
+    $ip = Get-LanIp
+    Write-Host "Windows 本地部署不配置公网域名。"
+    Write-Host "局域网访问地址：http://${ip}:$Port"
+    Write-Host "请确保 Windows 防火墙允许该端口，并让访问设备与本机处于同一局域网。"
 }
 
 function Run-LocalInstall([int]$Port) {
     $envPath = Join-Path $repoRoot ".env"
     if (-not (Test-Path $envPath)) { Copy-Item (Join-Path $repoRoot ".env.example") $envPath }
     Set-EnvValue $envPath "WEB_PORT" "$Port"
-    Set-EnvValue $envPath "WEB_BIND_ADDRESS" "127.0.0.1"
+    Set-EnvValue $envPath "WEB_BIND_ADDRESS" "0.0.0.0"
     Write-Host "已写入 WEB_PORT=$Port。"
     & (Join-Path $repoRoot "deploy/install-local.ps1") -NoOpen
 }
@@ -86,7 +83,7 @@ function Server-Menu {
         Clear-Host
         Write-Host "一、服务器安装"
         Write-Host "1：添加端口（回车默认 8787）"
-        Write-Host "2：添加域名（回车默认 IP 访问）"
+        Write-Host "2：添加域名（无域名时使用 IP 加端口）"
         Write-Host "3：返回上一级"
         $choice = Read-Host "请选择"
         switch ($choice) {
@@ -103,12 +100,12 @@ function Windows-Menu {
         Clear-Host
         Write-Host "二、Windows 本地安装"
         Write-Host "1：添加端口（回车默认 8787）"
-        Write-Host "2：添加域名（回车默认 IP 访问）"
+        Write-Host "2：本地局域网 IP 加端口"
         Write-Host "3：返回上一级"
         $choice = Read-Host "请选择"
         switch ($choice) {
             "1" { $port = Read-Port; Run-LocalInstall $port; Pause-Menu }
-            "2" { $port = Read-Port; if (Configure-Access $port) { Run-LocalInstall $port }; Pause-Menu }
+            "2" { $port = Read-Port; Show-LocalAccess $port; Run-LocalInstall $port; Pause-Menu }
             "3" { return }
             default { Write-Host "选项无效。" -ForegroundColor Yellow }
         }
