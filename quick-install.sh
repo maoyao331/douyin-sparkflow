@@ -174,9 +174,8 @@ server_menu() {
   while true; do
     print_header
     printf '一、服务器安装\n'
-    printf '1：添加端口（回车默认 8787）\n'
-    printf '2：添加域名（回车默认 IP 加端口访问）\n'
-    printf '3：返回上一级\n\n'
+    printf '1：添加端口和域名（端口回车默认 8787）\n'
+    printf '2：返回上一级\n\n'
     read -r -p '请选择：' choice
     case "$choice" in
       1)
@@ -187,14 +186,7 @@ server_menu() {
         fi
         pause
         ;;
-      2)
-        read_port
-        if configure_domain; then
-          run_server_install
-        fi
-        pause
-        ;;
-      3) return 0 ;;
+      2) return 0 ;;
       *) printf '选项无效。\n'; sleep 1 ;;
     esac
   done
