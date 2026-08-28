@@ -186,9 +186,8 @@ irm https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-inst
 
 ```text
 一：服务器安装
-  1：添加端口（回车默认 8787）
-  2：添加域名（回车默认使用 IP 加端口）
-  3：返回上一级
+  1：添加端口和域名（端口回车默认 8787）
+  2：返回上一级
 二：Windows 本地安装
   1：添加端口（回车默认 8787）
   2：局域网 IP 加端口访问
