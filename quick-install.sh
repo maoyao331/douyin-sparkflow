@@ -151,19 +151,40 @@ run_server_install() {
   fi
 }
 
+configure_server_access() {
+  local bind_domain
+  DOMAIN_VALUE=""
+  ACCESS_URL=""
+  read -r -p "是否绑定域名？输入 Y 绑定，直接回车使用 IP：" bind_domain
+  case "${bind_domain,,}" in
+    y|yes)
+      configure_domain || return 1
+      ;;
+    *)
+      local public_ip
+      public_ip="$(get_public_ip || true)"
+      public_ip="${public_ip:-服务器IP}"
+      ACCESS_URL="http://${public_ip}:${WEB_PORT_VALUE}"
+      printf '\n将使用 IP 访问：%s\n' "$ACCESS_URL"
+      ;;
+  esac
+}
+
 server_menu() {
   while true; do
     print_header
     printf '一、服务器安装\n'
     printf '1：添加端口（回车默认 8787）\n'
-    printf '2：添加域名（回车默认 IP 访问）\n'
+    printf '2：添加域名（回车默认 IP 加端口访问）\n'
     printf '3：返回上一级\n\n'
     read -r -p '请选择：' choice
     case "$choice" in
       1)
         read_port
         printf '已选择 Web 端口：%s\n' "$WEB_PORT_VALUE"
-        run_server_install
+        if configure_server_access; then
+          run_server_install
+        fi
         pause
         ;;
       2)
