@@ -112,18 +112,42 @@ NGINX
   printf 'Nginx 域名入口已配置：%s\n' "http://${domain}"
 }
 
+ensure_project_source() {
+  local installer_url installer_path
+  INSTALLER_PATH="$SCRIPT_DIR/deploy/install-server.sh"
+  if [[ -f "$INSTALLER_PATH" ]]; then
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update
+      apt-get install -y curl
+    else
+      printf '未找到 curl，无法下载官方安装脚本。\n' >&2
+      return 1
+    fi
+  fi
+  installer_url="https://raw.githubusercontent.com/halfwaystudent/douyin-sparkflow/main/deploy/install-server.sh"
+  installer_path="$(mktemp /tmp/douyin-sparkflow-installer.XXXXXX.sh)"
+  printf '\n当前为独立快捷脚本，正在下载官方服务器安装脚本...\n'
+  curl -fL "$installer_url" -o "$installer_path"
+  chmod 700 "$installer_path"
+  INSTALLER_PATH="$installer_path"
+}
+
 run_server_install() {
   local repo_url
   repo_url="${REPO_URL:-$REPO_URL_DEFAULT}"
+  ensure_project_source
   printf '\n开始执行服务器安装。此过程会安装 Docker 并构建镜像。\n'
   printf '现有 3x-ui/Xray 的 443 端口不会被本脚本占用。\n\n'
   if [[ -n "${DOMAIN_VALUE:-}" ]]; then
     WEB_PORT="$WEB_PORT_VALUE" WEB_BIND_ADDRESS="127.0.0.1" REPO_URL="$repo_url" \
-      bash "$SCRIPT_DIR/deploy/install-server.sh"
+      bash "$INSTALLER_PATH"
     install_domain_proxy "$DOMAIN_VALUE"
   else
     WEB_PORT="$WEB_PORT_VALUE" WEB_BIND_ADDRESS="0.0.0.0" REPO_URL="$repo_url" \
-      bash "$SCRIPT_DIR/deploy/install-server.sh"
+      bash "$INSTALLER_PATH"
   fi
 }
 
@@ -228,4 +252,5 @@ main_menu() {
 WEB_PORT_VALUE="$DEFAULT_PORT"
 ACCESS_URL=""
 DOMAIN_VALUE=""
+INSTALLER_PATH=""
 main_menu

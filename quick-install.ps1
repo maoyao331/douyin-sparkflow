@@ -4,6 +4,31 @@ $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $defaultPort = 8787
 $repoRoot = $scriptRoot
+$repoUrl = "https://github.com/maoyao331/douyin-sparkflow.git"
+
+function Ensure-ProjectSource {
+    if (Test-Path (Join-Path $scriptRoot "deploy/install-local.ps1")) { return }
+
+    $target = Join-Path (Get-Location) "douyin-sparkflow"
+    if (-not (Test-Path (Join-Path $target "deploy/install-local.ps1"))) {
+        if (Get-Command git -ErrorAction SilentlyContinue) {
+            Write-Host "正在下载项目源码到 $target ..."
+            git clone $repoUrl $target
+        } else {
+            $zip = Join-Path $env:TEMP "douyin-sparkflow-main.zip"
+            $extract = Join-Path $env:TEMP "douyin-sparkflow-main"
+            Write-Host "未找到 Git，正在下载项目压缩包..."
+            Invoke-WebRequest -Uri "https://github.com/maoyao331/douyin-sparkflow/archive/refs/heads/main.zip" -OutFile $zip
+            if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+            Expand-Archive -Path $zip -DestinationPath $env:TEMP -Force
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            Copy-Item -Path (Join-Path $extract "*") -Destination $target -Recurse -Force
+            Remove-Item -Force $zip -ErrorAction SilentlyContinue
+        }
+    }
+    $script:scriptRoot = $target
+    $script:repoRoot = $target
+}
 
 function Pause-Menu {
     Read-Host "按 Enter 返回菜单"
@@ -70,6 +95,7 @@ function Show-LocalAccess([int]$Port) {
 }
 
 function Run-LocalInstall([int]$Port) {
+    Ensure-ProjectSource
     $envPath = Join-Path $repoRoot ".env"
     if (-not (Test-Path $envPath)) { Copy-Item (Join-Path $repoRoot ".env.example") $envPath }
     Set-EnvValue $envPath "WEB_PORT" "$Port"
@@ -77,6 +103,8 @@ function Run-LocalInstall([int]$Port) {
     Write-Host "已写入 WEB_PORT=$Port。"
     & (Join-Path $repoRoot "deploy/install-local.ps1") -NoOpen
 }
+
+Ensure-ProjectSource
 
 function Server-Menu {
     while ($true) {
