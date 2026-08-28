@@ -50,7 +50,11 @@ get_public_ip() {
 
 configure_domain() {
   local domain public_ip
-  read -r -p "请输入域名（回车使用服务器 IP 访问）：" domain
+  if [[ $# -gt 0 ]]; then
+    domain="$1"
+  else
+    read -r -p "请输入域名（回车使用服务器 IP 访问）：" domain
+  fi
   domain="${domain,,}"
   public_ip="$(get_public_ip || true)"
   public_ip="${public_ip:-服务器IP}"
@@ -152,22 +156,27 @@ run_server_install() {
 }
 
 configure_server_access() {
-  local bind_domain
+  local domain public_ip
   DOMAIN_VALUE=""
   ACCESS_URL=""
-  read -r -p "是否绑定域名？输入 Y 绑定，直接回车使用 IP：" bind_domain
-  case "${bind_domain,,}" in
-    y|yes)
-      configure_domain || return 1
-      ;;
-    *)
-      local public_ip
-      public_ip="$(get_public_ip || true)"
-      public_ip="${public_ip:-服务器IP}"
-      ACCESS_URL="http://${public_ip}:${WEB_PORT_VALUE}"
-      printf '\n将使用 IP 访问：%s\n' "$ACCESS_URL"
-      ;;
-  esac
+  read -r -p "请输入域名（直接回车使用 IP 加端口）：" domain
+  domain="${domain,,}"
+
+  if [[ -z "$domain" ]]; then
+    public_ip="$(get_public_ip || true)"
+    public_ip="${public_ip:-服务器IP}"
+    ACCESS_URL="http://${public_ip}:${WEB_PORT_VALUE}"
+    printf '\n将使用 IP 访问：%s\n' "$ACCESS_URL"
+    return 0
+  fi
+
+  if ! valid_domain "$domain"; then
+    printf '域名格式无效，请输入完整域名，例如 spark.example.com；也可以直接回车使用 IP。\n'
+    return 1
+  fi
+
+  DOMAIN_VALUE="$domain"
+  configure_domain "$domain"
 }
 
 server_menu() {
