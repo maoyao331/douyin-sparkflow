@@ -162,7 +162,7 @@ python main.py --web
 curl -fL https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-install.sh -o quick-install.sh && chmod 700 quick-install.sh && bash quick-install.sh
 ```
 
-选择“服务器安装”后，可设置 Web 端口，直接回车默认使用 `8787`。如果不填写域名，访问地址为 `http://服务器IP:端口`；如果填写域名，脚本会让 SparkFlow Web 仅监听本机，并安装 Nginx 使用 80 端口转发，之后访问 `http://你的域名`，不需要再输入端口。请先在 Cloudflare 添加指向服务器 IP 的 `A` 记录。若开启小黄云，HTTPS 和 443 入口需要单独规划；脚本不会修改现有 Xray 的 443。
+选择“服务器安装”后，只需设置 Web 端口，直接回车默认使用 `8787`。服务器模式不再配置域名、不安装 Nginx，也不占用 80 端口；安装完成后使用 `http://服务器IP:端口` 访问。脚本不会修改现有 Xray 的 443。
 
 #### Windows 本地一键运行
 
@@ -178,7 +178,7 @@ irm https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-inst
 
 #### 卸载说明
 
-在快捷脚本主菜单选择“**四：卸载脚本**”，输入大写 `DELETE` 进行二次确认。服务器模式会停止并删除 SparkFlow 自身的 Docker 容器、相关镜像、网络、`/opt/douyin-sparkflow` 项目目录、运行状态、日志和代理配置；如果此前由快捷脚本创建了 Nginx 域名配置，也会一并删除。Windows 模式会停止并删除 SparkFlow 自身的容器、镜像、网络和项目文件，但不会卸载 Docker Desktop，也不会删除其他 Docker 项目。
+在快捷脚本主菜单选择“**四：卸载脚本**”，输入大写 `DELETE` 进行二次确认。服务器模式会停止并删除 SparkFlow 自身的 Docker 容器、相关镜像、网络、`/opt/douyin-sparkflow` 项目目录、运行状态、日志和代理配置；如果此前由旧版本快捷脚本创建了 Nginx 域名配置，也会一并删除。Windows 模式会停止并删除 SparkFlow 自身的容器、镜像、网络和项目文件，但不会卸载 Docker Desktop，也不会删除其他 Docker 项目。
 
 卸载不会删除 Docker 或 Nginx 软件，不会修改 3x-ui/Xray，不会停止其他容器，也不会修改 443 端口。卸载前请确认不再需要 `state/`、登录态、Cookie、账号数据和日志；这些运行时文件删除后不能通过脚本恢复。
 
@@ -186,7 +186,7 @@ irm https://raw.githubusercontent.com/maoyao331/douyin-sparkflow/main/quick-inst
 
 ```text
 一：服务器安装
-  1：添加端口和域名（端口回车默认 8787）
+  1：添加端口（回车默认 8787）
   2：返回上一级
 二：Windows 本地安装
   1：添加端口（回车默认 8787）
