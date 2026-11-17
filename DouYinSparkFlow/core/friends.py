@@ -1,12 +1,100 @@
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
-from core.browser import douyin_network_modes, get_browser
+from core.browser import (
+    account_profile_name,
+    acquire_browser_account_lock,
+    douyin_network_modes,
+    first_scrollable_element,
+    get_browser,
+    get_persistent_browser_context,
+    normalize_persistent_profile_config,
+    release_browser_account_lock,
+)
+from core.friend_identity import UserDetailCollector
+from core.identity import (
+    CATEGORY_IDENTITY_CONFLICT,
+    CATEGORY_IDENTITY_UNVERIFIED,
+    IdentityUnavailable,
+    account_uid,
+    fetch_trusted_identity,
+)
+from core.login import CARD_NOT_READY_MESSAGE, collect_login_result
+from core.streak_state import AUTH_COOKIE_NAMES
+from utils.config import get_config, normalize_unique_id
+from utils.logger import setup_logger
 
 
-logger = logging.getLogger(__name__)
+# The refresh runs inside the web process; without this the route/count/complete
+# lines never reach logs/app.log and a failed refresh is invisible.
+logger = setup_logger(level=logging.DEBUG)
 
 
+CATEGORY_LOGIN_REQUIRED = "login_required"
+CATEGORY_NETWORK_UNAVAILABLE = "network_unavailable"
+CATEGORY_STRUCTURE_CHANGED = "structure_changed"
+CATEGORY_EMPTY_RESULT = "empty_result"
+CATEGORY_INCOMPLETE_SCAN = "incomplete_scan"
+CATEGORY_BROWSER_CLEANUP_BLOCKED = "browser_cleanup_blocked"
+
+CATEGORY_LABELS = {
+    CATEGORY_LOGIN_REQUIRED: "登录失效",
+    CATEGORY_NETWORK_UNAVAILABLE: "网络不可用",
+    CATEGORY_STRUCTURE_CHANGED: "页面结构变化",
+    CATEGORY_EMPTY_RESULT: "未读到好友",
+    CATEGORY_INCOMPLETE_SCAN: "读取不完整",
+}
+
+
+class FriendScanResult(list):
+    """Friend names plus whether the scan provably reached the end of the list.
+
+    Behaves exactly like a list so existing callers keep working, but carries
+    ``complete`` so the caller can decide whether the result is strong enough to
+    refresh the send-time friend index. ``reason`` explains why an incomplete
+    scan stopped so the console can show it. When completeness is unknown (for
+    example a test double returning a plain list) it stays ``False``.
+    """
+
+    complete = False
+    reason = ""
+    uid_entries = ()
+    uid_summary = None
+
+    def __init__(self, names=(), *, complete=False, reason="", uid_entries=(), uid_summary=None):
+        super().__init__(names)
+        self.complete = bool(complete)
+        self.reason = str(reason or "")
+        # Friend uids read passively from the page's own user_detail responses.
+        # They only add stable keys; names and completeness stay DOM-owned.
+        self.uid_entries = [dict(entry) for entry in uid_entries or ()]
+        self.uid_summary = dict(uid_summary or {})
+
+
+class FriendRefreshError(RuntimeError):
+    """Friend refresh failure carrying a user-actionable category."""
+
+    def __init__(self, message, *, category=CATEGORY_STRUCTURE_CHANGED):
+        super().__init__(message)
+        self.category = category
+
+
+CREATOR_HOME_URL = "https://creator.douyin.com/"
+# The creator centre identity card is client-rendered and measured at 25-30s on a
+# cold cookie-only context, so this budget must cover a slow render instead of
+# turning it into a login failure.
+LOGIN_IDENTITY_TIMEOUT_MS = 60000
+IDENTITY_READ_ATTEMPTS = 2
+# A retry is only worth it when the first attempt failed inside this window (a
+# transient blank render); a failure that needed the whole budget is not that case.
+IDENTITY_RETRY_FAST_FAIL_MS = 15000
+# The retry starts from a freshly reloaded page, which needs the same cold render
+# time as the first attempt, so it gets a little more than the fast-failure window.
+IDENTITY_RETRY_BUDGET_MS = 20000
+# The reload before the retry only has to bring the shell back so the card can
+# render; waiting a full navigation timeout there would stall the save.
+IDENTITY_RELOAD_TIMEOUT_SECONDS = 20
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
@@ -66,6 +154,97 @@ NON_LOGIN_DIALOG_CLOSE_SELECTORS = (
 FRIEND_LIST_EMPTY_ROUNDS = 6
 FRIEND_LIST_EMPTY_WAIT_SECONDS = 1.5
 FRIEND_LIST_READY_TIMEOUT_SECONDS = 60
+# A virtualized list can stop producing rows long before it is exhausted, so
+# these bounds only end the read; they never prove the list was fully read.
+FRIEND_LIST_IDLE_ROUNDS = 5
+FRIEND_LIST_STUCK_ROUNDS = 2
+SCROLL_STEP_PX = 800
+SCROLL_SETTLE_SECONDS = 1.5
+# How long to wait for in-flight user_detail response bodies after the read.
+UID_DRAIN_TIMEOUT_SECONDS = 5
+
+
+def browser_account_cleanup_blocked(account):
+    """Whether a prior browser reader still owns this account's profile lock."""
+    # tasks owns the fail-closed registry.  This lazy import avoids importing the
+    # sender while module initialization is still resolving its browser helpers.
+    from core import tasks
+
+    return bool(account.get("browser_cleanup_blocked")) or (
+        account_profile_name(account) in tasks._BLOCKED_BROWSER_LOCKS
+    )
+
+
+def retain_browser_account_lock_for_cleanup(account, lock_handle, lock_path, lock_token, account_name):
+    """Fail closed when a passive response reader did not acknowledge exit."""
+    from datetime import datetime, timezone
+
+    from core import tasks
+
+    lock_key = account_profile_name(account)
+    tasks._BLOCKED_BROWSER_LOCKS[lock_key] = (lock_handle, lock_path, lock_token)
+    tasks._persist_account_send_failure(
+        account,
+        CATEGORY_BROWSER_CLEANUP_BLOCKED,
+        "browser cleanup not proven complete",
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        list(account.get("targets") or []),
+    )
+
+
+async def close_uid_collectors(*collectors):
+    """Detach and bound-close collectors without losing cancellation cleanup.
+
+    ``False`` means a reader remains alive and its account lock must stay held.
+    Callers still close every browser handle and re-raise cancellation afterward.
+    """
+    complete = True
+    cancelled = False
+    for collector in collectors:
+        if collector is None:
+            continue
+        try:
+            from core import tasks
+            for reader in collector.pending_tasks():
+                tasks._track_browser_operation(reader)
+            closed = await collector.aclose()
+            if not closed:
+                complete = False
+        except asyncio.CancelledError:
+            cancelled = True
+            complete = False
+        except Exception:
+            logger.debug("Failed to close uid collector", exc_info=True)
+            complete = False
+        try:
+            if collector.pending_tasks():
+                complete = False
+        except Exception:
+            complete = False
+    return complete, cancelled
+
+
+async def _close_friend_refresh_resources(page, context, browser, playwright):
+    """Return (complete, cancelled) after attempting every owned close."""
+    complete = True
+    cancelled = False
+    for resource, method, label in (
+        (page, "close", "page"),
+        (context, "close", "context"),
+        (browser, "close", "browser"),
+        (playwright, "stop", "Playwright"),
+    ):
+        if resource is None:
+            continue
+        try:
+            await getattr(resource, method)()
+        except asyncio.CancelledError:
+            complete = False
+            cancelled = True
+        except Exception:
+            complete = False
+            logger.debug("Failed to close friend refresh %s", label, exc_info=True)
+    return complete, cancelled
 
 
 def update_collection_progress(new_names_count, no_more_visible, scroll_moved, idle_rounds, stuck_rounds, idle_limit=5, stuck_limit=2):
@@ -80,34 +259,24 @@ async def _ensure_logged_in(page):
         try:
             locator = page.locator(selector).first
             if await locator.count() > 0 and await locator.is_visible():
-                raise RuntimeError("账号登录已失效，请重新扫码登录")
-        except RuntimeError:
+                raise FriendRefreshError(
+                    "账号登录已失效，请重新扫码登录",
+                    category=CATEGORY_LOGIN_REQUIRED,
+                )
+        except FriendRefreshError:
             raise
         except Exception:
             continue
 
 
 async def _dismiss_non_login_dialogs(page):
-    for text in NON_LOGIN_DIALOG_DISMISS_TEXTS:
-        try:
-            locator = page.get_by_text(text, exact=False).first
-            if await locator.count() > 0 and await locator.is_visible():
-                await locator.click(timeout=3000)
-                await asyncio.sleep(1)
-                return True
-        except Exception:
-            continue
-
-    for selector in NON_LOGIN_DIALOG_CLOSE_SELECTORS:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count() > 0 and await locator.is_visible():
-                await locator.click(timeout=3000)
-                await asyncio.sleep(1)
-                return True
-        except Exception:
-            continue
-    return False
+    # Share the sender's scoped, fail-closed policy. Never click page-wide text
+    # that could be a chat message rather than an actual dialog control.
+    from core.tasks import BrowserDialogBlocked, _dismiss_non_login_dialogs as inspect_dialogs
+    try:
+        return bool(await inspect_dialogs(page, "friend-refresh", "friend_list"))
+    except BrowserDialogBlocked as exc:
+        raise FriendRefreshError(str(exc), category=exc.category) from exc
 
 
 async def _click_friends_tab(page):
@@ -153,7 +322,9 @@ async def _friend_list_dom_summary(page):
 async def _first_visible_locator(page, selectors):
     for selector in selectors:
         try:
-            locator = page.locator(selector)
+            # Cached inactive lists may precede the visible tab in DOM order.
+            # Keep readiness and downstream scans scoped to visible rows.
+            locator = page.locator(selector).filter(visible=True)
             count = await locator.count()
             for index in range(min(count, 5)):
                 item = locator.nth(index)
@@ -191,13 +362,18 @@ async def _wait_for_friend_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY
         await asyncio.sleep(0.5)
 
     summary = await _friend_list_dom_summary(page)
-    raise RuntimeError(
+    # The chat page loaded but never exposed friend rows: a page/selector change,
+    # not a transport failure.
+    raise FriendRefreshError(
         "friend list did not become ready within timeout; "
-        f"dom={summary}"
+        f"dom={summary}",
+        category=CATEGORY_STRUCTURE_CHANGED,
     )
 
 
 async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOUT_SECONDS):
+    if not timeout_seconds:
+        timeout_seconds = FRIEND_LIST_READY_TIMEOUT_SECONDS
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
         await _ensure_logged_in(page)
@@ -207,15 +383,39 @@ async def _wait_for_chat_or_login(page, timeout_seconds=FRIEND_LIST_READY_TIMEOU
         except Exception:
             pass
         await asyncio.sleep(0.5)
-    raise RuntimeError("chat page did not load within timeout")
+    raise FriendRefreshError(
+        "chat page did not load within timeout",
+        category=CATEGORY_STRUCTURE_CHANGED,
+    )
 
 
-async def collect_friend_names(page):
+async def _read_friend_name(element):
+    """Return the row's nickname, or "" when the row has no nickname node.
+
+    A chat row also renders the last message and its timestamp, so reading the
+    row's first text line turned "16:23" and unread counters into friends.
+    """
+    for selector in FRIEND_NAME_SELECTORS:
+        try:
+            locator = element.locator(selector).first
+            if await locator.count() == 0:
+                continue
+            name = (await locator.inner_text(timeout=1000)).strip()
+        except Exception:
+            continue
+        if name:
+            return name
+    return ""
+
+
+async def collect_friend_names(page, on_progress=None):
     await _wait_for_chat_or_login(page)
     await _click_friends_tab(page)
     _, target_locator = await _wait_for_friend_rows_or_empty(page)
     if not target_locator:
-        return []
+        # The page announced the end of the list before rendering any row: a
+        # genuinely empty friend list, which is a complete read.
+        return FriendScanResult(complete=True)
 
     found_names = []
     seen_names = set()
@@ -226,69 +426,56 @@ async def collect_friend_names(page):
         _, target_locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
         if not target_locator:
             if found_names:
-                return found_names
+                return FriendScanResult(found_names, reason="读取过程中好友行消失")
             raise RuntimeError("好友列表已加载但未找到可读取的好友行")
 
         target_elements = await target_locator.all()
         new_names_count = 0
         for element in target_elements:
-            name = ""
-            for selector in FRIEND_NAME_SELECTORS:
-                try:
-                    name = (await element.locator(selector).first.inner_text(timeout=1000)).strip()
-                except Exception:
-                    continue
-                if name:
-                    break
-            if not name:
-                try:
-                    name = (await element.inner_text(timeout=1000)).splitlines()[0].strip()
-                except Exception:
-                    continue
+            name = await _read_friend_name(element)
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
             found_names.append(name)
             new_names_count += 1
 
+        if on_progress is not None:
+            on_progress(len(found_names))
+
         no_more_selector, _ = await _first_visible_locator(page, NO_MORE_SELECTORS)
         if no_more_selector:
-            return found_names
+            return FriendScanResult(found_names, complete=True)
 
         loading_selector, _ = await _first_visible_locator(page, LOADING_SELECTORS)
         if loading_selector:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(SCROLL_SETTLE_SECONDS)
 
-        scrollable_element = None
-        scrollable_selector = ""
-        for selector in SCROLLABLE_FRIENDS_SELECTORS:
-            try:
-                candidate = page.locator(selector).first
-                handle = await candidate.element_handle()
-                if not handle:
-                    continue
-                metrics = await page.evaluate(
-                    """(element) => ({
-                        clientHeight: element.clientHeight,
-                        scrollHeight: element.scrollHeight,
-                    })""",
-                    handle,
-                )
-                if int(metrics.get("clientHeight") or 0) > 0:
-                    scrollable_element = handle
-                    scrollable_selector = selector
-                    break
-            except Exception:
-                continue
-
+        scrollable_selector, scrollable_element = await first_scrollable_element(
+            page, SCROLLABLE_FRIENDS_SELECTORS
+        )
         if not scrollable_element:
             if found_names:
-                return found_names
+                return FriendScanResult(found_names, reason="未找到好友列表滚动容器")
             raise RuntimeError("未找到好友列表滚动容器")
 
+        metrics = await page.evaluate(
+            """(element) => ({
+                clientHeight: element.clientHeight,
+                scrollHeight: element.scrollHeight,
+            })""",
+            scrollable_element,
+        )
+        if int(metrics.get("scrollHeight") or 0) <= int(metrics.get("clientHeight") or 0):
+            # The container has nothing below the viewport, so the virtual list
+            # has already rendered every row: the read provably reached the end.
+            return FriendScanResult(found_names, complete=True)
+
         before_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
-        await page.evaluate("(element) => element.scrollTop += 800", scrollable_element)
-        await asyncio.sleep(1.5)
+        await page.evaluate(
+            f"(element) => element.scrollTop += {SCROLL_STEP_PX}",
+            scrollable_element,
+        )
+        await asyncio.sleep(SCROLL_SETTLE_SECONDS)
         after_top = await page.evaluate("(element) => element.scrollTop", scrollable_element)
         logger.debug(
             "Friend list refresh scroll selector=%s before=%s after=%s names=%s",
@@ -304,71 +491,500 @@ async def collect_friend_names(page):
             scroll_moved=after_top > before_top,
             idle_rounds=idle_rounds,
             stuck_rounds=stuck_rounds,
+            idle_limit=FRIEND_LIST_IDLE_ROUNDS,
+            stuck_limit=FRIEND_LIST_STUCK_ROUNDS,
         )
         if should_stop:
-            return found_names
+            reason = (
+                "列表滚动没有继续推进"
+                if stuck_rounds >= FRIEND_LIST_STUCK_ROUNDS
+                else "连续多轮没有读到新的好友"
+            )
+            return FriendScanResult(found_names, reason=reason)
 
 
-async def _fetch_account_friends_once(account, network_mode):
+async def _fetch_account_friends_once(
+    account,
+    network_mode,
+    *,
+    auth_only=False,
+    identity_timeout_ms=LOGIN_IDENTITY_TIMEOUT_MS,
+    on_progress=None,
+):
     cookies = list(account.get("cookies") or [])
+    account_name = str(account.get("username") or account.get("unique_id") or "")
     playwright = browser = context = page = None
+    lock_handle = lock_path = lock_token = None
+    uid_collector = None
+    cookie_session = None
+    from core import tasks
+
+    cookie_operations = set()
+    cookie_owner_token = tasks._BROWSER_OPERATION_OWNER.set(cookie_operations)
     try:
-        playwright, browser = await get_browser(GUI=False, network_mode=network_mode)
-        context = await browser.new_context()
+        if browser_account_cleanup_blocked(account):
+            raise FriendRefreshError(
+                "浏览器清理尚未确认完成，账号已暂停刷新",
+                category=CATEGORY_BROWSER_CLEANUP_BLOCKED,
+            )
+        # Reuse the account's persistent profile so the read drives the same
+        # browser identity as the sender instead of a throwaway cookie context.
+        # A pasted-cookie verification is intentionally isolated from that
+        # profile, but it still holds the same account lock until all readers
+        # and browser resources have acknowledged cleanup.
+        fresh_login = auth_only and account.get("_fresh_login_verification") is True
+        if fresh_login:
+            profile_config = {"enabled": False}
+        else:
+            profile_config = normalize_persistent_profile_config(
+                get_config(force_reload=True) or {}
+            )
+        # Non-persistent contexts can still leave a response-body task reading
+        # from this account. They use the same lock as profiles so a second
+        # refresh never starts an unlocked browser while cleanup is uncertain.
+        lock_handle, lock_path, lock_token = await acquire_browser_account_lock(
+            account, account_name
+        )
+        if profile_config["enabled"]:
+            playwright, context, _profile_dir = await get_persistent_browser_context(
+                account_profile_name(account),
+                root=profile_config["root"],
+                network_mode=network_mode,
+            )
+            # The profile helper owns generation-aware adoption/import. Do not
+            # overwrite a normal persistent session with this call's stale row.
+            from core.profile_cookies import prepare_profile_cookies
+            from core.tasks import _run_browser_stage
+
+            cookie_session = await _run_browser_stage(
+                "seed_cookies",
+                prepare_profile_cookies(context, account, profile_config, _profile_dir),
+            )
+        else:
+            playwright, browser = await get_browser(
+                GUI=False,
+                network_mode=network_mode,
+                profile_name=account_profile_name(account),
+            )
+            if fresh_login:
+                # Pasted credentials have no stable account profile yet. Never
+                # seed the check from a previous caller's "unknown" profile.
+                context = await browser.new_context(service_workers="block", accept_downloads=False)
+            else:
+                context = await browser.new_context()
+            await context.add_cookies(cookies)
         context.set_default_navigation_timeout(120000)
         context.set_default_timeout(120000)
         page = await context.new_page()
-        await context.add_cookies(cookies)
+
+        if auth_only:
+            # Only the creator home page exposes the logged-in identity, and a
+            # redirect away from it is itself proof that the session is invalid.
+            await page.goto(CREATOR_HOME_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
+            identity = None
+            verify_browser_identity = False
+            last_identity_error = None
+            for attempt in range(IDENTITY_READ_ATTEMPTS):
+                # The first attempt gets the full render budget; the retry starts
+                # from a reloaded page, so it gets the cold-render retry budget.
+                budget_ms = (
+                    identity_timeout_ms
+                    if attempt == 0
+                    else min(identity_timeout_ms, IDENTITY_RETRY_BUDGET_MS)
+                )
+                started_at = asyncio.get_running_loop().time()
+                try:
+                    identity = await collect_login_result(
+                        page,
+                        context,
+                        timeout_ms=budget_ms,
+                    )
+                    break
+                except FriendRefreshError:
+                    raise
+                except Exception as exc:
+                    last_identity_error = exc
+                    elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000
+                    if _left_creator_host(page):
+                        # The page bounced away from the creator host: the session
+                        # is not usable.
+                        raise FriendRefreshError(
+                            "Cookie 无法登录抖音创作者中心，请重新获取 Cookie",
+                            category=CATEGORY_LOGIN_REQUIRED,
+                        ) from exc
+                    if classify_refresh_error(exc) == CATEGORY_LOGIN_REQUIRED:
+                        # A visible login form is a real answer, not a slow page.
+                        raise _with_category(exc, CATEGORY_LOGIN_REQUIRED) from exc
+                    if str(exc) == CARD_NOT_READY_MESSAGE and account_uid(account):
+                        # A missing home-page card is not an identity proof.
+                        # Existing bound accounts can instead prove the browser
+                        # session's UID after the private-message page loads.
+                        identity = {
+                            "unique_id": account_uid(account),
+                            "display_id": str(account.get("display_id") or ""),
+                            "username": account_name,
+                        }
+                        verify_browser_identity = True
+                        logger.info("Creator card unavailable; checking bound browser identity on the chat page")
+                        break
+                    # Only a failure that came back quickly can be a transient
+                    # blank render; a full-budget timeout means the card needs
+                    # longer than the budget, and a shorter retry cannot fix that.
+                    retryable = elapsed_ms < IDENTITY_RETRY_FAST_FAIL_MS
+                    if attempt + 1 < IDENTITY_READ_ATTEMPTS and retryable:
+                        logger.info(
+                            "Identity read attempt %s failed after %sms (%s); reloading the creator page once",
+                            attempt + 1,
+                            round(elapsed_ms),
+                            type(exc).__name__,
+                        )
+                        try:
+                            await page.reload(
+                                wait_until="commit",
+                                timeout=min(
+                                    FRIEND_LIST_READY_TIMEOUT_SECONDS,
+                                    IDENTITY_RELOAD_TIMEOUT_SECONDS,
+                                ) * 1000,
+                            )
+                        except Exception:
+                            logger.debug("Creator page reload failed", exc_info=True)
+                        continue
+                    # Still on the creator host but the identity did not render: this
+                    # is a slow or changed page, so let the caller try other routes
+                    # instead of blaming the Cookie.
+                    raise _with_category(exc, classify_refresh_error(exc)) from exc
+            if identity is None:
+                raise _with_category(
+                    last_identity_error or RuntimeError("creator identity could not be read"),
+                    classify_refresh_error(last_identity_error),
+                )
+            # Also require the friend private-message page to be readable, so a
+            # session that cannot reach the friend list is not reported healthy.
+            await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
+            await _wait_for_chat_or_login(page)
+            if verify_browser_identity:
+                try:
+                    chat_url = urlsplit(page.url)
+                    chat_is_current = (
+                        chat_url.scheme == "https"
+                        and chat_url.hostname == "creator.douyin.com"
+                        and chat_url.port in {None, 443}
+                        and not chat_url.username and not chat_url.password
+                        and chat_url.path.rstrip("/") == urlsplit(CHAT_PAGE_URL).path
+                    )
+                except ValueError:
+                    chat_is_current = False
+                if not chat_is_current:
+                    raise FriendRefreshError("私信页跳转到其他页面，无法确认登录状态")
+                browser_cookies = await context.cookies([
+                    "https://creator.douyin.com/", "https://www.douyin.com/",
+                ])
+                try:
+                    trusted = await asyncio.to_thread(fetch_trusted_identity, browser_cookies)
+                except IdentityUnavailable as exc:
+                    raise FriendRefreshError(str(exc), category=CATEGORY_IDENTITY_UNVERIFIED) from exc
+                if trusted["uid"] != account_uid(account):
+                    raise FriendRefreshError(
+                        "登录浏览器身份与已绑定账号不一致，已停止验证",
+                        category=CATEGORY_IDENTITY_CONFLICT,
+                    )
+                # An SPA shell alone is not a usable chat view. Read friend
+                # readiness only after proving whose browser session it is.
+                await _click_friends_tab(page)
+                await _wait_for_friend_rows_or_empty(page)
+            return {
+                # Page text only (handle or UID); not an identity proof.
+                "unique_id": normalize_unique_id(identity.get("unique_id")),
+                "display_id": str(identity.get("display_id") or ""),
+                "username": str(identity.get("username") or "").strip(),
+            }
+
+        # Listen (never request) for the page's own friend-profile responses so
+        # the read also learns each friend's uid.
+        uid_collector = UserDetailCollector(account_name, purpose="refresh").attach(page)
         await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
         await asyncio.sleep(1)
 
-        friends = await collect_friend_names(page)
+        friends = await collect_friend_names(page, on_progress=on_progress)
+        if not isinstance(friends, FriendScanResult):
+            friends = FriendScanResult(friends)
+        await uid_collector.drain(timeout=UID_DRAIN_TIMEOUT_SECONDS)
+        friends.uid_entries = uid_collector.entries()
+        friends.uid_summary = uid_collector.summary()
+        logger.info(
+            "Friend uid collection account=%s responses=%s parsed=%s uids=%s errors=%s",
+            account_name or "unknown",
+            friends.uid_summary.get("responses"),
+            friends.uid_summary.get("parsed"),
+            len(friends.uid_entries),
+            friends.uid_summary.get("errors") or "-",
+        )
+        # A list read does not prove the current account UID. Preserve browser
+        # rotations in the profile, but do not publish this unverified snapshot.
         return friends
     except RuntimeError:
         raise
     except Exception as exc:
         raise RuntimeError(f"刷新好友列表失败，请重试：{exc}") from exc
     finally:
-        if page:
-            await page.close()
-        if context:
-            await context.close()
-        if browser:
-            await browser.close()
-        if playwright:
-            await playwright.stop()
+        try:
+            collector_complete, collector_cancelled = await close_uid_collectors(uid_collector)
+            resources_complete, resource_cancelled = await _close_friend_refresh_resources(
+                page, context, browser, playwright
+            )
+            pending_cookie_operations = any(not task.done() for task in cookie_operations)
+            if lock_handle is not None:
+                if collector_complete and resources_complete and not resource_cancelled and not pending_cookie_operations:
+                    try:
+                        release_browser_account_lock(
+                            lock_handle, lock_path, lock_token, account_name
+                        )
+                    except Exception:
+                        logger.debug("Failed to release friend refresh account lock", exc_info=True)
+                else:
+                    retain_browser_account_lock_for_cleanup(
+                        account, lock_handle, lock_path, lock_token, account_name
+                    )
+            if collector_cancelled or resource_cancelled:
+                raise asyncio.CancelledError
+            if not collector_complete:
+                raise FriendRefreshError(
+                    "浏览器 UID 读取器未停止，账号已暂停刷新",
+                    category=CATEGORY_BROWSER_CLEANUP_BLOCKED,
+                )
+        finally:
+            tasks._BROWSER_OPERATION_OWNER.reset(cookie_owner_token)
 
 
-async def fetch_account_friends(account):
+async def verify_account_session(account, *, auth_only=False, network_mode=None):
+    """Verify a stored cookie set by actually loading the friend chat page.
+
+    Returns ``{"verified": True, "friends": [...], "identity": {...}}`` when the
+    login state is usable. Raises :class:`FriendRefreshError` with a user
+    actionable category when the login state is not usable or the page could not
+    be read.
+    """
     cookies = list(account.get("cookies") or [])
     if not cookies:
-        raise RuntimeError("account has no cookies; scan login QR code first")
+        raise FriendRefreshError(
+            "账号没有保存 Cookie，无法验证登录态",
+            category=CATEGORY_LOGIN_REQUIRED,
+        )
+
+    modes = [network_mode] if network_mode else douyin_network_modes()
+    last_category = CATEGORY_NETWORK_UNAVAILABLE
+    last_error = None
+    for mode in modes:
+        try:
+            payload = await _fetch_account_friends_once(
+                account,
+                mode,
+                auth_only=auth_only,
+            )
+        except FriendRefreshError as exc:
+            if exc.category in {CATEGORY_LOGIN_REQUIRED, CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
+                raise
+            if exc.category == CATEGORY_STRUCTURE_CHANGED:
+                # The page loaded on the creator host but its DOM never rendered
+                # the account card; another egress route cannot change that, so
+                # stop here instead of doubling the wait for the same answer.
+                raise FriendRefreshError(
+                    f"无法读取好友私信页，无法验证登录态：{exc}",
+                    category=CATEGORY_STRUCTURE_CHANGED,
+                ) from exc
+            last_category = exc.category
+            last_error = exc
+            logger.warning("Session verification route=%s failed: %s", mode, exc)
+            continue
+        except RuntimeError as exc:
+            # Raw failures carry their category as an attribute when the detector
+            # already knows it; re-deriving it from the text alone would ignore
+            # that and, for example, burn the other egress route on a page problem.
+            attached = getattr(exc, "category", None)
+            last_category = attached or classify_refresh_error(exc)
+            if last_category == CATEGORY_LOGIN_REQUIRED:
+                raise FriendRefreshError(
+                    str(exc),
+                    category=CATEGORY_LOGIN_REQUIRED,
+                ) from exc
+            if attached == CATEGORY_STRUCTURE_CHANGED or _looks_like_structure_failure(exc):
+                # The page loaded on the creator host but its DOM never rendered
+                # the account card; another egress route cannot change that, so
+                # stop here instead of doubling the wait for the same answer.
+                raise FriendRefreshError(
+                    f"无法读取好友私信页，无法验证登录态：{exc}",
+                    category=CATEGORY_STRUCTURE_CHANGED,
+                ) from exc
+            last_error = exc
+            logger.warning("Session verification route=%s failed: %s", mode, exc)
+            continue
+        except Exception as exc:
+            last_category = classify_refresh_error(exc)
+            last_error = exc
+            logger.warning("Session verification route=%s failed: %s", mode, exc)
+            continue
+        if auth_only:
+            identity = dict(payload or {})
+            friends = []
+        else:
+            friends = list(payload or [])
+            identity = {}
+        logger.info(
+            "Session verification route=%s identity=%s",
+            mode,
+            "resolved" if identity.get("unique_id") else "unresolved",
+        )
+        return {
+            "verified": True,
+            "friends": friends,
+            "identity": identity,
+        }
+
+    raise FriendRefreshError(
+        f"无法读取好友私信页，无法验证登录态：{last_error}",
+        category=last_category,
+    )
+
+
+STRUCTURE_ERROR_MARKERS = (
+    "did not become ready",
+    "did not load",
+    "dom=",
+    "好友列表已加载但未找到",
+    "未找到好友列表滚动容器",
+    "未找到朋友私信标签",
+)
+
+NETWORK_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "net::",
+    "err_",
+    "proxy",
+    "connection",
+    "connect",
+    "dns",
+    "目标计算机积极拒绝",
+    "network",
+    "网络",
+)
+
+LOGIN_ERROR_MARKERS = ("login", "cookie", "scan", "登录", "扫码")
+
+
+def _with_category(error, category):
+    """Attach a category to an error without losing its type or message."""
+    if category == CATEGORY_LOGIN_REQUIRED:
+        return FriendRefreshError(str(error), category=category)
+    try:
+        setattr(error, "category", category)
+        return error
+    except (AttributeError, TypeError):
+        return FriendRefreshError(str(error), category=category)
+
+
+def _left_creator_host(page):
+    """True when the page is no longer on the Douyin creator host."""
+    try:
+        current_url = str(page.url or "")
+    except Exception:
+        return False
+    if not current_url:
+        return False
+    # A failed load leaves Chromium on its own error or blank page; that is a
+    # network problem, not a redirect to the login page.
+    if current_url.startswith(("chrome-error://", "about:")):
+        return False
+    return "creator.douyin.com" not in current_url
+
+
+def _looks_like_structure_failure(exc):
+    """True when the message itself names a page or DOM problem.
+
+    ``classify_refresh_error`` falls back to the structure category for text it
+    does not recognise, so an explicit marker check keeps an unknown error from
+    skipping the remaining egress routes.
+    """
+    text = str(exc or "").lower()
+    return any(marker in text for marker in STRUCTURE_ERROR_MARKERS)
+
+
+def classify_refresh_error(exc):
+    """Map a refresh failure to one of the three user-facing categories.
+
+    Categories are attached where the failure is detected; this helper only
+    classifies raw/unknown errors, and it distinguishes a loaded page with
+    missing DOM from a transport failure.
+    """
+    if isinstance(exc, FriendRefreshError):
+        return exc.category
+    text = str(exc or "").lower()
+    if any(marker in text for marker in STRUCTURE_ERROR_MARKERS):
+        return CATEGORY_STRUCTURE_CHANGED
+    if any(marker in text for marker in LOGIN_ERROR_MARKERS):
+        return CATEGORY_LOGIN_REQUIRED
+    if any(marker in text for marker in NETWORK_ERROR_MARKERS):
+        return CATEGORY_NETWORK_UNAVAILABLE
+    return CATEGORY_STRUCTURE_CHANGED
+
+
+async def fetch_account_friends(account, on_progress=None):
+    cookies = list(account.get("cookies") or [])
+    if not cookies:
+        raise FriendRefreshError(
+            "account has no cookies; scan login QR code first",
+            category=CATEGORY_LOGIN_REQUIRED,
+        )
 
     modes = douyin_network_modes()
     last_error = None
     for index, network_mode in enumerate(modes):
         try:
-            friends = await _fetch_account_friends_once(account, network_mode)
+            payload = await _fetch_account_friends_once(
+                account, network_mode, on_progress=on_progress
+            )
+            friends = list(payload or [])
+            complete = bool(getattr(payload, "complete", False))
+            reason = str(getattr(payload, "reason", "") or "")
             logger.info(
-                "Friend refresh route=%s count=%s attempt=%s/%s",
+                "Friend refresh account=%s route=%s count=%s complete=%s "
+                "reason=%s attempt=%s/%s",
+                account.get("username") or account.get("unique_id") or "unknown",
                 network_mode,
                 len(friends),
+                complete,
+                reason or "-",
                 index + 1,
                 len(modes),
             )
             if friends or index == len(modes) - 1:
-                return friends
+                return FriendScanResult(
+                    friends,
+                    complete=complete,
+                    reason=reason,
+                    uid_entries=getattr(payload, "uid_entries", ()) or (),
+                    uid_summary=getattr(payload, "uid_summary", None),
+                )
             logger.warning(
                 "Friend refresh route=%s returned zero friends; trying next route",
                 network_mode,
             )
-        except RuntimeError as exc:
-            text = str(exc).lower()
-            if any(marker in text for marker in ("login", "cookie", "scan", "登录", "扫码")):
+        except FriendRefreshError as exc:
+            if exc.category in {CATEGORY_LOGIN_REQUIRED, CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
                 raise
             last_error = exc
             logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
-        except Exception as exc:
-            last_error = exc
+        except RuntimeError as exc:
+            category = classify_refresh_error(exc)
+            if category == CATEGORY_LOGIN_REQUIRED:
+                raise FriendRefreshError(str(exc), category=category) from exc
+            last_error = _with_category(exc, category)
             logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
-    raise RuntimeError(f"friend refresh failed after routes {modes}: {last_error}")
+        except Exception as exc:
+            last_error = _with_category(exc, classify_refresh_error(exc))
+            logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
+    raise FriendRefreshError(
+        f"friend refresh failed after routes {modes}: {last_error}",
+        category=classify_refresh_error(last_error),
+    )
+

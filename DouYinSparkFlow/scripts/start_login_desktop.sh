@@ -9,6 +9,13 @@ export LOGIN_DESKTOP_WEB_PORT="${LOGIN_DESKTOP_WEB_PORT:-8788}"
 
 mkdir -p /data/login-profile
 mkdir -p /app/logs/login_desktop
+if [ -n "${LOGIN_DESKTOP_API_TOKEN_FILE:-}" ]; then
+  mkdir -p "$(dirname "${LOGIN_DESKTOP_API_TOKEN_FILE}")"
+  if [ ! -s "${LOGIN_DESKTOP_API_TOKEN_FILE}" ]; then
+    umask 077
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${LOGIN_DESKTOP_API_TOKEN_FILE}"
+  fi
+fi
 
 pkill -f "Xvfb ${DISPLAY}" >/dev/null 2>&1 || true
 pkill -f "x11vnc .*${LOGIN_DESKTOP_VNC_PORT}" >/dev/null 2>&1 || true
@@ -42,6 +49,9 @@ done
 
 fluxbox > /app/logs/login_desktop/fluxbox.log 2>&1 &
 run_forever x11vnc x11vnc -display "${DISPLAY}" -forever -shared -rfbport "${LOGIN_DESKTOP_VNC_PORT}" -localhost -nopw -nap -wait 50 -defer 50 &
+if ! python /app/scripts/ensure_novnc_metadata.py --web-root /usr/share/novnc; then
+  printf '%s\n' 'noVNC package metadata could not be generated; continuing without version badge' >&2
+fi
 run_forever novnc websockify --web=/usr/share/novnc "${LOGIN_DESKTOP_WEB_PORT}" "127.0.0.1:${LOGIN_DESKTOP_VNC_PORT}" &
 
 exec python /app/login_desktop_server.py

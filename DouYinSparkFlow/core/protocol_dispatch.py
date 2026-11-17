@@ -4,17 +4,21 @@ import os
 import random
 import shutil
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core import refusal_retry, send_pause
+from core import streak_state
 from core.msg_builder import build_messages_for_targets
-from utils.config import get_userData, normalize_unique_id, repo_root, save_userData
+from utils.config import get_userData, normalize_unique_id, repo_root, update_user_data
 from utils.logger import setup_logger
 
 
 logger = setup_logger()
 PROTOCOL_SCRIPT = repo_root() / "core" / "protocol_sender.mjs"
 NODE_HELPER_IMAGE = "node:22-alpine"
+DEFAULT_PROTOCOL_TIMEOUT_SECONDS = 1800
 
 
 def _coerce_non_negative_int(value, default):
@@ -22,6 +26,80 @@ def _coerce_non_negative_int(value, default):
         return max(0, int(value))
     except (TypeError, ValueError):
         return max(0, int(default))
+
+
+def _protocol_timeout_seconds():
+    raw = str(
+        os.getenv("SPARKFLOW_PROTOCOL_TIMEOUT_SECONDS")
+        or DEFAULT_PROTOCOL_TIMEOUT_SECONDS
+    ).strip()
+    try:
+        return max(30, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid SPARKFLOW_PROTOCOL_TIMEOUT_SECONDS=%r, using %s",
+            raw,
+            DEFAULT_PROTOCOL_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_PROTOCOL_TIMEOUT_SECONDS
+
+
+def _build_protocol_target_identities(user, messages_by_target):
+    cache = [
+        dict(item)
+        for item in (user.get("protocol_targets_cache") or [])
+        if isinstance(item, dict)
+    ]
+    by_nickname = {}
+    for entry in cache:
+        nickname = str(entry.get("nickname") or "").strip()
+        if nickname:
+            normalized_nickname = (
+                streak_state.normalize_target_name(nickname).casefold()
+            )
+            by_nickname.setdefault(normalized_nickname, []).append(entry)
+
+    identities = {}
+    for target in (messages_by_target or {}):
+        target_name = str(target).strip()
+        # Protocol dispatch only supports a resolved one-to-one peer. Explicit
+        # group targets are browser-only even if a stale cache happens to carry
+        # a matching display name.
+        if target_name.startswith(("群聊：", "群聊:")):
+            continue
+        target_ref = streak_state.target_ref_for_stored_key(user, target_name)
+        stable_matches = [
+            entry
+            for entry in cache
+            if target_ref
+            and target_ref in streak_state._refs_from_record(entry)
+        ]
+        normalized_target = (
+            streak_state.normalize_target_name(target_name).casefold()
+        )
+        if stable_matches:
+            match = stable_matches[0]
+        else:
+            matches = by_nickname.get(normalized_target) or []
+            if len(matches) > 1:
+                identities[target] = {"ambiguous": True}
+                continue
+            if len(matches) != 1:
+                continue
+            match = matches[0]
+        sec_uid = str(match.get("secUid") or "").strip()
+        peer_user_id = str(match.get("peerUserId") or "").strip()
+        if not sec_uid and not peer_user_id:
+            continue
+        identities[target] = {
+            key: value
+            for key, value in (
+                ("secUid", sec_uid),
+                ("peerUserId", peer_user_id),
+            )
+            if value
+        }
+    return identities
 
 
 def _normalize_send_strategy(config):
@@ -100,37 +178,76 @@ def _protocol_failure_reason(entry):
     return " ".join(bits)
 
 
+def _protocol_entry_succeeded(entry):
+    if entry.get("dryRun"):
+        return False
+    return (
+        entry.get("success") is True
+        and entry.get("statusCode") in (0, "0")
+    )
+
+
 def _persist_protocol_account_failure(account, category, reason, affected_targets=None):
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    all_accounts = get_userData(force_reload=True)
-    accounts_by_identity = {
-        identity: item
-        for item in all_accounts
-        for identity in [_account_identity_key(item)]
-        if identity
-    }
-    target_account = accounts_by_identity.get(_account_identity_key(account))
-    if not target_account:
-        return
-
     affected_targets = list(affected_targets or [])
-    existing_entry = dict(target_account.get("account_failure") or {})
-    target_account["account_failure"] = {
-        "category": category,
-        "reason": reason,
-        "firstAttemptAt": existing_entry.get("firstAttemptAt") or now_iso,
-        "lastAttemptAt": now_iso,
-        "attemptCount": _coerce_attempt_count(existing_entry) + 1,
-        "lastRunMode": "protocol",
-        "affectedTargets": affected_targets,
-    }
-    save_userData(all_accounts)
+
+    def mutate(all_accounts):
+        accounts_by_identity = {
+            identity: item
+            for item in all_accounts
+            for identity in [_account_identity_key(item)]
+            if identity
+        }
+        target_account = accounts_by_identity.get(_account_identity_key(account))
+        if not target_account:
+            return None, False
+        existing_entry = dict(target_account.get("account_failure") or {})
+        target_account["account_failure"] = {
+            "category": category,
+            "reason": reason,
+            "firstAttemptAt": existing_entry.get("firstAttemptAt") or now_iso,
+            "lastAttemptAt": now_iso,
+            "attemptCount": _coerce_attempt_count(existing_entry) + 1,
+            "lastRunMode": "protocol",
+            "affectedTargets": affected_targets,
+        }
+        return dict(target_account["account_failure"]), True
+
+    return update_user_data(mutate, force_reload=True)
 
 
-def _record_protocol_target_failure(target_account, target_name, message, category, reason):
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _record_protocol_target_failure(
+    target_account,
+    target_name,
+    message,
+    category,
+    reason,
+    *,
+    now=None,
+):
+    now = now or datetime.now(timezone.utc)
+    now_iso = now.isoformat(timespec="seconds")
+    state = streak_state.mark_failed(
+        target_account,
+        target_name,
+        category=category,
+        reason=reason,
+        retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
+        now=now,
+        strategy="protocol",
+    )
+    if (
+        state.get("status") not in streak_state.FAILED_STATES
+        or str(state.get("lastErrorCategory") or "") != str(category or "")
+        or str(state.get("lastAttemptAt") or "") != now_iso
+    ):
+        return False
     queue = dict(target_account.get("failure_queue") or {})
-    existing_entry = dict(queue.get(target_name) or {})
+    existing_entry = streak_state.failure_entry(
+        target_account,
+        target_name,
+        timezone.utc,
+    )
     queue[target_name] = {
         "category": category,
         "reason": reason,
@@ -141,12 +258,12 @@ def _record_protocol_target_failure(target_account, target_name, message, catego
         "lastRunMode": "protocol",
     }
     target_account["failure_queue"] = queue
+    return True
 
 
-def _merge_protocol_runtime_state(accounts, result_by_username):
+def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
     changed = False
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    all_accounts = get_userData(force_reload=True)
+    now = datetime.now(timezone.utc)
     accounts_by_identity = {
         identity: account
         for account in all_accounts
@@ -167,11 +284,12 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
         if protocol_cache is not None:
             target_account["protocol_targets_cache"] = protocol_cache
             target_account["protocol_user_id"] = result.get("userId", "")
+            streak_state.reconcile_account(target_account, now)
             changed = True
 
         history = dict(target_account.get("message_history") or {})
         for entry in result.get("sent", []):
-            if entry.get("dryRun") or not entry.get("success", True):
+            if not _protocol_entry_succeeded(entry):
                 continue
 
             target = str(entry.get("target", "")).strip()
@@ -179,46 +297,287 @@ def _merge_protocol_runtime_state(accounts, result_by_username):
             if not target or not message:
                 continue
 
+            entry_sent_at = (
+                streak_state._parse_time(
+                    entry.get("sentAt"),
+                    timezone.utc,
+                )
+                or now
+            )
+            state = streak_state.mark_send_confirmed(
+                target_account,
+                target,
+                strategy="protocol",
+                now=entry_sent_at,
+                source="protocol_send_receipt",
+                detail=str(entry.get("statusName") or entry.get("statusCode") or ""),
+            )
+            if (
+                str(state.get("status") or "")
+                != streak_state.STATE_SEND_CONFIRMED
+                or str(state.get("confirmedAt") or "")
+                != entry_sent_at.isoformat(timespec="seconds")
+            ):
+                continue
             history[target] = {
                 "message": message,
-                "sentAt": str(entry.get("sentAt", now_iso)),
+                "sentAt": entry_sent_at.isoformat(timespec="seconds"),
+                "status": "confirmed",
+                "confirmationLevel": "strong",
+                "confirmationSource": "protocol_send_receipt",
+                "confirmationDetail": (
+                    f"statusCode={entry.get('statusCode')} "
+                    f"statusName={entry.get('statusName') or ''}"
+                ).strip(),
+                "needsVerification": False,
             }
+            failure_queue = dict(target_account.get("failure_queue") or {})
+            failure_queue.pop(target, None)
+            if failure_queue:
+                target_account["failure_queue"] = failure_queue
+            else:
+                target_account.pop("failure_queue", None)
+
+            account_failure = dict(target_account.get("account_failure") or {})
+            affected_targets = [
+                item
+                for item in (account_failure.get("affectedTargets") or [])
+                if not streak_state.target_keys_match(
+                    target_account,
+                    item,
+                    target,
+                )
+            ]
+            if affected_targets:
+                account_failure["affectedTargets"] = affected_targets
+                target_account["account_failure"] = account_failure
+            elif account_failure:
+                target_account.pop("account_failure", None)
             changed = True
 
         if history:
             target_account["message_history"] = history
 
         for entry in result.get("sent", []):
-            if entry.get("dryRun") or entry.get("success", True):
+            if entry.get("dryRun") or _protocol_entry_succeeded(entry):
                 continue
             target = str(entry.get("target", "")).strip()
             if not target:
                 continue
-            _record_protocol_target_failure(
+            failure_at = (
+                streak_state._parse_time(
+                    entry.get("sentAt"),
+                    timezone.utc,
+                )
+                or now
+            )
+            changed = _record_protocol_target_failure(
                 target_account,
                 target,
                 str(entry.get("message", "")).strip(),
                 _protocol_failure_category(entry),
                 _protocol_failure_reason(entry),
-            )
-            changed = True
+                now=failure_at,
+            ) or changed
 
         unresolved = result.get("unresolved", []) or []
         for entry in unresolved:
             target = str(entry.get("target", "")).strip()
             if not target:
                 continue
-            _record_protocol_target_failure(
+            changed = _record_protocol_target_failure(
                 target_account,
                 target,
                 "",
                 str(entry.get("reason") or "protocol_unresolved"),
                 str(entry.get("reason") or "protocol could not resolve target"),
-            )
-            changed = True
+                now=(
+                    streak_state._parse_time(
+                        entry.get("sentAt"),
+                        timezone.utc,
+                    )
+                    or now
+                ),
+            ) or changed
 
-    if changed:
-        save_userData(all_accounts)
+    return changed
+
+
+def _merge_protocol_runtime_state(accounts, result_by_username):
+    def mutate(all_accounts):
+        changed = _apply_protocol_runtime_state(
+            all_accounts,
+            accounts,
+            result_by_username,
+        )
+        return None, changed
+
+    update_user_data(mutate, force_reload=True)
+
+
+def _mark_protocol_targets_in_flight(user, run_id, *, allow_retry=False):
+    from core import personal_streak, recovery_queue
+
+    from core import automatic_recovery, tasks
+    if (user.get(automatic_recovery.TICKET)
+            or (recovery_queue.enabled() and tasks._is_global_recovery_context())):
+        # The recovery engine is explicitly browser-only; a direct/manual
+        # protocol claim cannot bypass its time guards or durable queue.
+        return []
+
+    now = datetime.now(timezone.utc)
+    personal_scope = user.get("_personal_scope")
+    if not recovery_queue.allowed_now(now):
+        return []
+    if isinstance(personal_scope, dict):
+        # Legacy global schedules carry a live authorization scope but no
+        # personal profile timezone.  Preserve their global quota policy only
+        # after revalidating the mapping; a forged legacy marker must not skip
+        # the ownership check.
+        if personal_scope.get("legacy_global_schedule"):
+            if not personal_streak.authorized(user):
+                return []
+            schedule_timezone = None
+        else:
+            # Durable rows deliberately omit the personal scope. Capture the
+            # profile timezone only after validating this live scope, then
+            # carry it through every quota decision made against the
+            # scope-less disk row.
+            schedule_timezone = personal_streak.authorized_schedule_timezone(user)
+            if schedule_timezone is None:
+                return []
+    else:
+        schedule_timezone = None
+
+    def automatic_claim_allowed(account, target_name):
+        if refusal_retry.used_today(
+                account, target_name, now, schedule_timezone=schedule_timezone):
+            return False
+        state = streak_state.target_state(account, target_name, now)
+        if (state.get("status") == streak_state.STATE_FAILED_TERMINAL
+                and state.get("lastErrorCategory") == "send_rejected"):
+            # Same-day, future and unreadable refusal times are never normal
+            # automatic protocol work. A valid previous day is a new daily send.
+            return refusal_retry.rejection_precedes_today(
+                account, target_name, now, schedule_timezone=schedule_timezone,
+            )
+        return True
+
+    def mutate(accounts):
+        matched = streak_state.find_matching_account(accounts, user)
+        if matched is None:
+            return ([], []), False
+        claimed_targets = []
+        reserved_targets = []
+        for target_name in user.get("targets") or []:
+            if not allow_retry and not automatic_claim_allowed(matched, target_name):
+                continue
+            before = streak_state.target_state(matched, target_name, now)
+            consume = (
+                allow_retry
+                and before.get("lastErrorCategory") == "send_rejected"
+                and not refusal_retry.rejection_precedes_today(
+                    matched, target_name, now, schedule_timezone=schedule_timezone,
+                )
+                and not refusal_retry.used_today(
+                    matched, target_name, now, schedule_timezone=schedule_timezone,
+                )
+            )
+            state, claimed = streak_state.claim_in_flight(
+                matched,
+                target_name,
+                run_id=run_id,
+                strategy="protocol",
+                now=now,
+                allow_retry=allow_retry,
+            )
+            if (
+                claimed
+                and
+                state.get("status") == streak_state.STATE_IN_FLIGHT
+                and str(state.get("runId") or "") == str(run_id or "")
+            ):
+                if consume:
+                    if refusal_retry.reserve(
+                            matched, target_name, now, run_id,
+                            schedule_timezone=schedule_timezone,
+                    ) is None:
+                        continue
+                    reserved_targets.append(str(target_name))
+                claimed_targets.append(str(target_name))
+        return (claimed_targets, reserved_targets), bool(claimed_targets)
+
+    persisted = update_user_data(mutate, force_reload=True) or ([], [])
+    claimed_targets, reserved_targets = persisted
+    if not reserved_targets:
+        return claimed_targets
+
+    # A reservation is not permission until independently read back from disk.
+    accounts = get_userData(force_reload=True)
+    verified = streak_state.find_matching_account(accounts, user)
+    if verified is None:
+        return [target for target in claimed_targets if target not in reserved_targets]
+    verified_reserved = set()
+    for target_name in reserved_targets:
+        ref = streak_state.resolve_target_ref(verified, target_name)
+        reservation = (verified.get(refusal_retry.KEY) or {}).get(ref) or {}
+        state = streak_state.target_state(verified, target_name, now)
+        if (
+            refusal_retry.used_today(
+                verified, target_name, now, schedule_timezone=schedule_timezone,
+            )
+            and reservation.get("runId") == run_id
+            and state.get("status") == streak_state.STATE_IN_FLIGHT
+            and str(state.get("runId") or "") == str(run_id or "")
+        ):
+            verified_reserved.add(target_name)
+    return [
+        target for target in claimed_targets
+        if target not in reserved_targets or target in verified_reserved
+    ]
+
+
+def _protocol_claimed_targets(user, run_id):
+    now = datetime.now(timezone.utc)
+
+    def mutate(accounts):
+        matched = streak_state.find_matching_account(accounts, user)
+        if matched is None:
+            return [], False
+        claimed = []
+        for target_name in user.get("targets") or []:
+            state = streak_state.target_state(matched, target_name, now)
+            if (
+                state.get("status") == streak_state.STATE_IN_FLIGHT
+                and str(state.get("runId") or "") == str(run_id or "")
+            ):
+                claimed.append(str(target_name))
+        return claimed, False
+
+    return update_user_data(mutate, force_reload=True) or []
+
+
+def _mark_protocol_targets_failed(user, category, reason):
+    now = datetime.now(timezone.utc)
+    retryable = str(category or "") not in streak_state.TERMINAL_FAILURE_CATEGORIES
+
+    def mutate(accounts):
+        matched = streak_state.find_matching_account(accounts, user)
+        if matched is None:
+            return None, False
+        for target_name in user.get("targets") or []:
+            streak_state.mark_failed(
+                matched,
+                target_name,
+                category=category,
+                reason=reason,
+                retryable=retryable,
+                now=now,
+                strategy="protocol",
+            )
+        return None, True
+
+    update_user_data(mutate, force_reload=True)
 
 
 def _host_repo_root():
@@ -235,16 +594,25 @@ def _host_repo_root():
 def _build_protocol_command():
     node_path = shutil.which("node")
     if node_path:
-        return [node_path, str(PROTOCOL_SCRIPT)], repo_root(), "local-node", str(repo_root())
+        return (
+            [node_path, str(PROTOCOL_SCRIPT)],
+            repo_root(),
+            "local-node",
+            str(repo_root()),
+            None,
+        )
 
     docker_path = shutil.which("docker")
     if docker_path:
         host_repo = _host_repo_root()
+        container_name = f"sparkflow-protocol-{uuid.uuid4().hex[:12]}"
         return (
             [
                 docker_path,
                 "run",
                 "--rm",
+                "--name",
+                container_name,
                 "-i",
                 "--network",
                 "host",
@@ -259,28 +627,85 @@ def _build_protocol_command():
             repo_root(),
             "docker-node-helper",
             "/workspace",
+            container_name,
         )
 
     raise RuntimeError("Neither node nor docker is available for the protocol sender")
 
 
 def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
-    command, cwd, runner_label, runtime_repo_root = _build_protocol_command()
+    if send_pause.should_pause_sending():
+        return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "sending-paused"}
+    from core import recovery_queue, automatic_recovery, tasks
+    if (user.get(automatic_recovery.TICKET)
+            or (recovery_queue.enabled() and tasks._is_global_recovery_context())):
+        return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "recovery-browser-only"}
+    now = datetime.now(timezone.utc)
+    if not recovery_queue.allowed_now(now):
+        return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "recovery-window-closed"}
+    (
+        command,
+        cwd,
+        runner_label,
+        runtime_repo_root,
+        container_name,
+    ) = _build_protocol_command()
     payload = {
         "repoRoot": runtime_repo_root,
         "dryRun": dry_run,
         "account": user,
         "messagesByTarget": messages_by_target,
+        "targetIdentities": _build_protocol_target_identities(
+            user,
+            messages_by_target,
+        ),
         "sendStrategy": send_strategy,
     }
-    process = subprocess.run(
-        command,
-        input=json.dumps(payload, ensure_ascii=False),
-        text=True,
-        capture_output=True,
-        cwd=str(cwd),
-        check=False,
-    )
+    deadline = None
+    if (user.get("_personal_scope") or {}).get("claim"):
+        from core import personal_streak
+        deadline = personal_streak.protocol_send_deadline(user)
+        if deadline is None:
+            return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "personal-window-closed"}
+    context = recovery_queue._ctx(now) if recovery_queue.enabled() else None
+    if context is not None:
+        service_local = context[2]
+        service_deadline = int(service_local.replace(
+            hour=23, minute=50, second=0, microsecond=0,
+        ).timestamp() * 1000)
+        deadline = service_deadline if deadline is None else min(deadline, service_deadline)
+    if deadline is not None:
+        payload["personalSendDeadlineEpochMs"] = deadline
+    timeout_seconds = _protocol_timeout_seconds()
+    try:
+        process = subprocess.run(
+            command,
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            cwd=str(cwd),
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if container_name:
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                logger.warning(
+                    "Failed to stop timed-out protocol container=%s",
+                    container_name,
+                )
+        raise RuntimeError(
+            f"{user.get('username', 'unknown')} protocol sender timed out "
+            f"after {timeout_seconds}s"
+        ) from exc
 
     stdout = (process.stdout or "").strip()
     if not stdout:
@@ -306,7 +731,18 @@ def _run_protocol_for_user(user, messages_by_target, dry_run, send_strategy):
     return data
 
 
-async def run_protocol_tasks(config, accounts, message_builder):
+async def run_protocol_tasks(config, accounts, message_builder, run_id="", *, allow_retry=False):
+    if send_pause.should_pause_sending():
+        logger.info("Skipping protocol sender: sending is temporarily paused")
+        return []
+    from core import personal_streak
+    if accounts and not all("_personal_scope" in account for account in accounts):
+        groups = personal_streak.account_groups(config, accounts, manual=True)
+        if not groups or any("_personal_scope" in account for _, group in groups for account in group):
+            results = []
+            for effective, group in groups:
+                results.extend(await run_protocol_tasks(effective, group, message_builder, run_id, allow_retry=allow_retry))
+            return results
     del message_builder
 
     dry_run = bool(config.get("protocolDryRun", False))
@@ -317,6 +753,18 @@ async def run_protocol_tasks(config, accounts, message_builder):
 
     async def _worker(user):
         async with semaphore:
+            from core import recovery_queue
+            claimed_personal_job = bool(
+                (user.get("_personal_scope") or {}).get("claim")
+            )
+            if not recovery_queue.allowed_now(datetime.now(timezone.utc)):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "recovery-window-closed"}
+            if not personal_streak.authorized(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "ownership-changed"}
+            # Claimed personal jobs are bound by their saved end time.  Manual
+            # personal and global runs deliberately retain no-claim semantics.
+            if claimed_personal_job and not personal_streak.within_send_window(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "personal-window-closed"}
             start_delay = random.randint(
                 send_strategy["accountStartDelaySecondsMin"],
                 send_strategy["accountStartDelaySecondsMax"],
@@ -329,7 +777,44 @@ async def run_protocol_tasks(config, accounts, message_builder):
                 )
                 await asyncio.sleep(start_delay)
 
+            if claimed_personal_job and not personal_streak.within_send_window(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "personal-window-closed"}
+            if not recovery_queue.allowed_now(datetime.now(timezone.utc)):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "recovery-window-closed"}
             logger.info("Starting protocol sender for %s", user.get("username", "unknown"))
+            if run_id and not dry_run:
+                claimed_targets = _mark_protocol_targets_in_flight(
+                    user,
+                    run_id,
+                    allow_retry=allow_retry,
+                )
+                if claimed_targets is None:
+                    raise RuntimeError(
+                        f"unable to claim protocol targets for {user.get('username', 'unknown')}"
+                    )
+                claimed = {
+                    streak_state.normalize_target_name(target_name)
+                    for target_name in claimed_targets
+                }
+                user = dict(user)
+                user["targets"] = [
+                    target_name
+                    for target_name in user.get("targets") or []
+                    if streak_state.normalize_target_name(target_name) in claimed
+                ]
+                if not user["targets"]:
+                    logger.info(
+                        "Skipping protocol sender for %s because no targets need sending",
+                        user.get("username", "unknown"),
+                    )
+                    return {
+                        "ok": True,
+                        "sent": [],
+                        "resolved": [],
+                        "unresolved": [],
+                        "runner": "state-machine-skipped",
+                        "dryRun": dry_run,
+                    }
             messages_by_target = build_messages_for_targets(
                 user.get("targets", []),
                 previous_messages=user.get("message_history", {}),
@@ -344,6 +829,8 @@ async def run_protocol_tasks(config, accounts, message_builder):
                 send_strategy["messageIntervalSecondsMax"],
                 os.getenv("SPARKFLOW_MANUAL_RUN") == "1",
             )
+            if not personal_streak.authorized(user):
+                return {"ok": False, "sent": [], "resolved": [], "unresolved": [], "runner": "ownership-changed"}
             result = await asyncio.to_thread(
                 _run_protocol_for_user,
                 user,
@@ -381,12 +868,19 @@ async def run_protocol_tasks(config, accounts, message_builder):
             reason = str(item)
             failures.append(reason)
             logger.error("Protocol sender failed for %s: %s", user.get("username", "unknown"), item)
+            claimed_targets = _protocol_claimed_targets(user, run_id)
             _persist_protocol_account_failure(
                 user,
                 "protocol_sender_failed",
                 reason,
                 user.get("targets", []),
             )
+            if claimed_targets:
+                _mark_protocol_targets_failed(
+                    dict(user, targets=claimed_targets),
+                    "protocol_sender_failed",
+                    reason,
+                )
             continue
         result_by_username[user.get("username")] = item
         unresolved = item.get("unresolved", [])

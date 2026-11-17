@@ -109,6 +109,7 @@ def _public_item(item: dict | None) -> dict | None:
         "ticket": item.get("ticket", ""),
         "username": item.get("username", ""),
         "account_ref": item.get("account_ref", ""),
+        "login_generation": item.get("login_generation", ""),
         "requested_at": item.get("requested_at", 0),
         "started_at": item.get("started_at", 0),
         "last_heartbeat_at": item.get("last_heartbeat_at", 0),
@@ -137,13 +138,14 @@ def owns(lock: dict | None, *, username: str, session_id: str, account_ref: str 
     return True
 
 
-def _new_item(username: str, session_id: str, account_ref: str, now: float, mode: str = "relogin") -> dict:
+def _new_item(username: str, session_id: str, account_ref: str, login_generation: str, now: float, mode: str = "relogin") -> dict:
     return {
         "ticket": "ticket-" + uuid.uuid4().hex,
         "mode": mode if mode in {"relogin", "add"} else "relogin",
         "username": username,
         "session_id": session_id,
         "account_ref": account_ref,
+        "login_generation": login_generation,
         "requested_at": now,
         "started_at": now,
         "last_heartbeat_at": now,
@@ -160,7 +162,27 @@ def find_request(state: dict, *, username: str, session_id: str) -> tuple[str, d
     return "none", None, -1
 
 
-def request_workspace(*, username: str, session_id: str, account_ref: str = "", mode: str = "relogin") -> dict:
+def _same_request_context(item: dict, *, account_ref: str, login_generation: str, mode: str) -> bool:
+    """Keep one owner from silently reusing a workspace for another login."""
+    requested_mode = mode if mode in {"relogin", "add"} else "relogin"
+    return (
+        str(item.get("mode") or "relogin") == requested_mode
+        and str(item.get("account_ref") or "") == str(account_ref or "")
+        and str(item.get("login_generation") or "") == str(login_generation or "")
+    )
+
+
+def _context_conflict(kind: str, position: int, existing: dict, state: dict) -> dict:
+    return {
+        "state": "conflict",
+        "current_state": kind,
+        "position": position,
+        "request": deepcopy(existing),
+        "workspace": state,
+    }
+
+
+def request_workspace(*, username: str, session_id: str, account_ref: str = "", login_generation: str = "", mode: str = "relogin") -> dict:
     with _MUTEX:
         state = _normalize_state(_read_raw())
         now = _now()
@@ -168,10 +190,12 @@ def request_workspace(*, username: str, session_id: str, account_ref: str = "", 
             queue = state.setdefault("queue", [])
             kind, existing, position = find_request(state, username=username, session_id=session_id)
             if kind == "queued":
+                if not _same_request_context(existing, account_ref=account_ref, login_generation=login_generation, mode=mode):
+                    return _context_conflict(kind, position, existing, state)
                 return {"state": "queued", "position": position, "request": deepcopy(existing), "workspace": state}
             if len(queue) >= QUEUE_MAX_SIZE:
                 return {"state": "full", "position": -1, "request": None, "workspace": state}
-            item = _new_item(username, session_id, account_ref, now, mode=mode)
+            item = _new_item(username, session_id, account_ref, login_generation, now, mode=mode)
             item["started_at"] = 0
             item["last_heartbeat_at"] = 0
             queue.append(item)
@@ -180,22 +204,26 @@ def request_workspace(*, username: str, session_id: str, account_ref: str = "", 
         elif state.get("active") and not _expired(state["active"], now):
             kind, existing, position = find_request(state, username=username, session_id=session_id)
             if kind == "active":
+                if not _same_request_context(existing, account_ref=account_ref, login_generation=login_generation, mode=mode):
+                    return _context_conflict(kind, position, existing, state)
                 existing["last_heartbeat_at"] = now
                 _write_state(state)
                 return {"state": "active", "position": 0, "request": deepcopy(existing), "workspace": state}
             if kind == "queued":
+                if not _same_request_context(existing, account_ref=account_ref, login_generation=login_generation, mode=mode):
+                    return _context_conflict(kind, position, existing, state)
                 return {"state": "queued", "position": position, "request": deepcopy(existing), "workspace": state}
             queue = state.setdefault("queue", [])
             if len(queue) >= QUEUE_MAX_SIZE:
                 return {"state": "full", "position": -1, "request": None, "workspace": state}
-            item = _new_item(username, session_id, account_ref, now, mode=mode)
+            item = _new_item(username, session_id, account_ref, login_generation, now, mode=mode)
             item["started_at"] = 0
             item["last_heartbeat_at"] = 0
             queue.append(item)
             _write_state(state)
             return {"state": "queued", "position": len(queue), "request": deepcopy(item), "workspace": state}
         else:
-            item = _new_item(username, session_id, account_ref, now, mode=mode)
+            item = _new_item(username, session_id, account_ref, login_generation, now, mode=mode)
             state = {"version": 2, "phase": "active", "active": item, "queue": state.get("queue", [])}
             _write_state(state)
             return {"state": "active", "position": 0, "request": deepcopy(item), "workspace": state}
@@ -293,7 +321,7 @@ def cancel_request(*, username: str, session_id: str, ticket: str = "") -> tuple
             if str(item.get("username")) == str(username) and str(item.get("session_id")) == str(session_id) and (not ticket or str(item.get("ticket")) == str(ticket)):
                 removed = queue.pop(index)
                 state["queue"] = queue
-                if queue or state.get("active"):
+                if queue or state.get("active") or state.get("phase") == "resetting":
                     _write_state(state)
                 else:
                     _delete_state()
@@ -315,7 +343,7 @@ def workspace_status(*, username: str, session_id: str) -> dict:
 
 
 # Backward-compatible single-lease helpers used by existing tests and callers.
-def acquire(*, username: str, session_id: str, account_ref: str = "", force: bool = False) -> tuple[bool, dict | None]:
+def acquire(*, username: str, session_id: str, account_ref: str = "", login_generation: str = "", force: bool = False) -> tuple[bool, dict | None]:
     with _MUTEX:
         state = _normalize_state(_read_raw())
         if force:
@@ -323,7 +351,7 @@ def acquire(*, username: str, session_id: str, account_ref: str = "", force: boo
         active = state.get("active")
         if active and not owns(active, username=username, session_id=session_id, account_ref=account_ref):
             return False, active
-    result = request_workspace(username=username, session_id=session_id, account_ref=account_ref)
+    result = request_workspace(username=username, session_id=session_id, account_ref=account_ref, login_generation=login_generation)
     return result["state"] == "active", result.get("request")
 
 

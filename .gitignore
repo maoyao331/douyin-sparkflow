@@ -1,4 +1,4 @@
-﻿.env
+.env
 state/
 logs/
 output/
@@ -19,3 +19,20 @@ DouYinSparkFlow/config.json
 
 .migration-backups/
 DouYinSparkFlow/webui_users.json
+DouYinSparkFlow/webui_passkeys.json
+DouYinSparkFlow/webui_sessions.json
+DouYinSparkFlow/*.lock
+# >>> Comet managed project state >>>
+!/.comet/
+/.comet/*
+!/.comet/config.yaml
+# <<< Comet managed project state <<<
+.data-backups/
+
+# Server-local runtime backups and pre-theme backups (never committed)
+/backups/
+DouYinSparkFlow/.theme-backup-*/
+
+# Vendored archives are not tracked; add them as build/CI downloads instead.
+*.whl
+DouYinSparkFlow/webui/static/*.zip

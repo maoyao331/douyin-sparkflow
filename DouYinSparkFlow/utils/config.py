@@ -4,10 +4,14 @@ import os
 import secrets
 import sys
 import tempfile
+import time
 import uuid
 from copy import deepcopy
 from enum import Enum
 from pathlib import Path
+
+from filelock import FileLock
+from utils.secure_storage import StorageError, encryption_required, read_json, serialize_json
 
 from utils.logger import setup_logger
 
@@ -69,8 +73,38 @@ DEFAULT_CONFIG = {
         "seedCookiesWhenEmpty": True,
         "syncStoredCookiesBeforeRun": True,
         "refreshStoredCookiesAfterLogin": True
+    },
+    "notifications": {
+        "enabled": False,
+        "channels": {
+            "telegram": {
+                "enabled": False,
+                "useProxy": True,
+                "botToken": "",
+                "chatId": ""
+            },
+            "dingtalk": {
+                "enabled": False,
+                "useProxy": False,
+                "webhookUrl": "",
+                "secret": ""
+            },
+            "wecom": {
+                "enabled": False,
+                "useProxy": False,
+                "webhookUrl": ""
+            },
+            "webhook": {
+                "enabled": False,
+                "useProxy": False,
+                "url": "",
+                "extraFields": {}
+            }
+        }
     }
 }
+
+LEGACY_OPS_LOG_FILE = "/var/log/douyin-sparkflow.log"
 
 DEFAULT_APP_SETTINGS = {
     "admin_username": "admin",
@@ -78,10 +112,10 @@ DEFAULT_APP_SETTINGS = {
     "session_secret": "",
     "session_max_age_seconds": 8 * 60 * 60,
     "compose_root": "",
-    "ui_host": "0.0.0.0",
+    "ui_host": "127.0.0.1",
     "ui_port": 8787,
     "login_poll_interval_seconds": 1,
-    "ops_log_file": "/var/log/douyin-sparkflow.log",
+    "ops_log_file": "/app/logs/douyin-sparkflow.log",
     "proxy_refresh_script": "/opt/douyin-sparkflow/refresh_proxy.sh",
     "local_login_helper_url": "http://127.0.0.1:18765",
     "login_desktop_api_url": "http://127.0.0.1:18090",
@@ -162,14 +196,16 @@ def _load_json_file(path, defaults=None):
     if not path.exists():
         if defaults is None:
             raise FileNotFoundError(path)
-        path.write_text(json.dumps(defaults, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_json_file(path, defaults)
         return deepcopy(defaults)
 
     text = path.read_text(encoding="utf-8")
     if not text.strip():
+        if encryption_required():
+            raise StorageError("Protected storage is empty.")
         return deepcopy(defaults) if defaults is not None else None
 
-    data = json.loads(text)
+    data = read_json(path, text=text)
     if defaults is None:
         return data
     # _merge_defaults only works with dicts; for list-shaped data
@@ -179,21 +215,31 @@ def _load_json_file(path, defaults=None):
     return _merge_defaults(data, defaults)
 
 
-def _save_json_file(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+def _save_json_file(path, data, *, allow_plaintext_migration=False):
+    temp_name = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serialized = serialize_json(data, path, allow_plaintext_migration=allow_plaintext_migration)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
+            handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
-    finally:
         try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
+            os.chmod(path, 0o600)
+        except OSError:
             pass
+    except OSError as exc:
+        raise StorageError("Unable to save application storage.") from exc
+    finally:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("Could not remove a temporary storage file")
 
 
 def get_config(force_reload=False):
@@ -205,9 +251,39 @@ def get_config(force_reload=False):
 
 def save_config(new_config):
     global config
-    config = _merge_defaults(new_config, DEFAULT_CONFIG)
-    _save_json_file(config_path(), config)
+    updated = _merge_defaults(new_config, DEFAULT_CONFIG)
+    _save_json_file(config_path(), updated)
+    config = updated
     return deepcopy(config)
+
+
+def update_config(
+    mutator,
+    *,
+    path=None,
+    force_reload=True,
+    timeout=30,
+    return_changed=False,
+):
+    target = Path(path) if path is not None else config_path()
+    with FileLock(f"{target}.lock", timeout=timeout):
+        current = (
+            _load_json_file(target, DEFAULT_CONFIG)
+            if path is not None
+            else get_config(force_reload=force_reload)
+        )
+        result = mutator(current)
+        changed = True
+        if isinstance(result, tuple) and len(result) == 2:
+            result, changed = result
+        if changed:
+            if path is None:
+                save_config(current)
+            else:
+                _save_json_file(target, _merge_defaults(current, DEFAULT_CONFIG))
+        if return_changed:
+            return deepcopy(result), changed
+        return deepcopy(result)
 
 
 def get_userData(force_reload=False):
@@ -231,9 +307,68 @@ def get_userData(force_reload=False):
 def save_userData(accounts):
     global userData
     normalized = list(accounts)
-    userData = normalized
     _save_json_file(users_data_path(), normalized)
+    userData = normalized
     return deepcopy(userData)
+
+
+DATA_BACKUP_DIR = ".data-backups"
+DATA_BACKUP_KEEP = 10
+
+
+def _snapshot_user_data(target: Path) -> None:
+    """Keep a dated copy of account data before a destructive write.
+
+    Account data had no rolling backups at all, so a bad identity match or a
+    mistaken delete left nothing to fall back to except a month-old snapshot.
+    """
+    try:
+        if not target.exists():
+            return
+        content = read_json(target)
+        backup_dir = target.parent / DATA_BACKUP_DIR
+        backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = backup_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{target.name}"
+        if not destination.exists():
+            _save_json_file(destination, content)
+        keep = sorted(backup_dir.glob(f"*-{target.name}"))
+        for stale in keep[:-DATA_BACKUP_KEEP]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        logger.warning("Could not snapshot %s before writing", target, exc_info=True)
+
+
+def update_user_data(
+    mutator,
+    *,
+    path=None,
+    force_reload=True,
+    timeout=30,
+    return_changed=False,
+):
+    target = Path(path) if path is not None else users_data_path()
+    with FileLock(f"{target}.lock", timeout=timeout):
+        accounts = (
+            _load_json_file(target, [])
+            if path is not None
+            else get_userData(force_reload=force_reload)
+        )
+        result = mutator(accounts)
+        changed = True
+        if isinstance(result, tuple) and len(result) == 2:
+            result, changed = result
+        if changed:
+            _snapshot_user_data(target)
+            if path is None:
+                save_userData(accounts)
+            else:
+                _save_json_file(target, accounts)
+        if return_changed:
+            return deepcopy(result), changed
+        return deepcopy(result)
 
 
 def normalize_unique_id(unique_id):
@@ -245,7 +380,6 @@ def normalize_unique_id(unique_id):
 
 def upsert_user_account(unique_id, username, cookies, targets, extra=None):
     unique_id = normalize_unique_id(unique_id)
-    accounts = get_userData(force_reload=True)
     payload = {
         "account_ref": f"acc-{uuid.uuid4().hex}",
         "unique_id": unique_id,
@@ -256,50 +390,175 @@ def upsert_user_account(unique_id, username, cookies, targets, extra=None):
     if extra:
         payload.update(extra)
 
-    for account in accounts:
-        if normalize_unique_id(account.get("unique_id")) == unique_id:
-            payload["account_ref"] = account.get("account_ref") or payload["account_ref"]
-            if "enabled" not in payload:
-                payload["enabled"] = account.get("enabled", True)
-            account.update(payload)
-            save_userData(accounts)
-            return account
+    def mutate(accounts):
+        for account in accounts:
+            if normalize_unique_id(account.get("unique_id")) == unique_id:
+                payload["account_ref"] = (
+                    account.get("account_ref") or payload["account_ref"]
+                )
+                if "enabled" not in payload:
+                    payload["enabled"] = account.get("enabled", True)
+                account.update(payload)
+                return deepcopy(account), True
 
-    if "enabled" not in payload:
-        payload["enabled"] = True
-    accounts.append(payload)
-    save_userData(accounts)
-    return payload
+        if "enabled" not in payload:
+            payload["enabled"] = True
+        accounts.append(payload)
+        return deepcopy(payload), True
+
+    return update_user_data(mutate, force_reload=True)
+
+
+MERGE_MAP_KEYS = (
+    "target_states",
+    "target_refs",
+    "friend_index",
+    "friend_index_meta",
+    "message_history",
+    "friend_uids",
+    "target_uid_bindings",
+)
+
+
+def merge_user_account_into(source_unique_id, target_unique_id, *, path=None):
+    """Merge one account row into another, then drop the source row.
+
+    Duplicate rows appear when a re-login returns a different unique_id than the
+    stored one. The targets and send history live on the row the operator is
+    about to remove, so they are carried over instead of being deleted with it.
+    Identity fields (unique_id, cookies, health) always stay the target's, and
+    disagreements resolve in the target's favour.
+    """
+    source_id = normalize_unique_id(source_unique_id)
+    target_id = normalize_unique_id(target_unique_id)
+    if not source_id or not target_id or source_id == target_id:
+        raise ValueError("merge needs two different accounts")
+
+    def mutate(accounts):
+        source = next(
+            (item for item in accounts if normalize_unique_id(item.get("unique_id")) == source_id),
+            None,
+        )
+        target = next(
+            (item for item in accounts if normalize_unique_id(item.get("unique_id")) == target_id),
+            None,
+        )
+        if source is None or target is None:
+            return None, False
+
+        targets = list(target.get("targets") or [])
+        for name in source.get("targets") or []:
+            if name not in targets:
+                targets.append(name)
+        target["targets"] = targets
+
+        for key in MERGE_MAP_KEYS:
+            merged = dict(target.get(key) or {})
+            for name, value in (source.get(key) or {}).items():
+                merged.setdefault(name, value)
+            if merged:
+                target[key] = merged
+
+        if source.get("enabled") and not target.get("enabled"):
+            target["enabled"] = True
+        if not (target.get("friends_cache") or []) and (source.get("friends_cache") or []):
+            target["friends_cache"] = list(source.get("friends_cache") or [])
+            if source.get("friends_cache_updated_at"):
+                target["friends_cache_updated_at"] = source["friends_cache_updated_at"]
+
+        accounts.remove(source)
+        return target, True
+
+    return update_user_data(mutate, path=path, force_reload=True, return_changed=True)
 
 
 def delete_user_account(unique_id):
     normalized_id = normalize_unique_id(unique_id)
-    accounts = get_userData(force_reload=True)
-    remaining = [item for item in accounts if normalize_unique_id(item.get("unique_id")) != normalized_id]
-    removed = len(accounts) != len(remaining)
-    if removed:
-        save_userData(remaining)
-    return removed
+
+    def mutate(accounts):
+        remaining = [
+            item
+            for item in accounts
+            if normalize_unique_id(item.get("unique_id")) != normalized_id
+        ]
+        removed = len(accounts) != len(remaining)
+        if removed:
+            accounts[:] = remaining
+        return removed, removed
+
+    return update_user_data(mutate, force_reload=True)
+
+
+def _migrate_legacy_app_settings(settings):
+    """Point a stored legacy trigger-log path at the mounted log file.
+
+    The scheduler streams trigger output into /app/logs/douyin-sparkflow.log,
+    while /var/log is not a mounted volume: an install that stored the old
+    default would keep the panel reading a file nothing writes to.
+    """
+    if str(settings.get("ops_log_file") or "").strip() == LEGACY_OPS_LOG_FILE:
+        settings["ops_log_file"] = DEFAULT_APP_SETTINGS["ops_log_file"]
+    return settings
 
 
 def get_app_settings(force_reload=False):
     global appSettings
     if appSettings is None or force_reload:
-        appSettings = _load_json_file(app_settings_path(), DEFAULT_APP_SETTINGS)
-        if not appSettings.get("session_secret"):
-            appSettings["session_secret"] = secrets.token_urlsafe(32)
-        if not appSettings.get("compose_root"):
-            appSettings["compose_root"] = default_compose_root()
-        _save_json_file(app_settings_path(), appSettings)
+        target = app_settings_path()
+        with FileLock(f"{target}.lock", timeout=30):
+            updated = _load_json_file(target, DEFAULT_APP_SETTINGS)
+            before = deepcopy(updated)
+            _migrate_legacy_app_settings(updated)
+            if not updated.get("session_secret"):
+                updated["session_secret"] = secrets.token_urlsafe(32)
+            if not updated.get("compose_root"):
+                updated["compose_root"] = default_compose_root()
+            if updated != before:
+                _save_json_file(target, updated)
+            appSettings = updated
     return deepcopy(appSettings)
+
+
+def read_app_settings():
+    """Read a fresh atomic snapshot; initialization still owns the write lock."""
+    target = app_settings_path()
+    if not target.exists():
+        return get_app_settings(force_reload=True)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise StorageError("Unable to read application settings.") from exc
+    if not text.strip():
+        return get_app_settings(force_reload=True)
+    settings = read_json(target, text=text)
+    if not isinstance(settings, dict):
+        raise StorageError("Invalid application settings.")
+    if not settings.get("session_secret") or not settings.get("compose_root") or settings.get("ops_log_file") == LEGACY_OPS_LOG_FILE:
+        return get_app_settings(force_reload=True)
+    return _merge_defaults(settings, DEFAULT_APP_SETTINGS)
+
+
+def douyin_proxy_url(settings=None):
+    """Explicit proxy for Douyin traffic: SPARKFLOW_DOUYIN_PROXY_URL wins over the panel setting.
+
+    Returns "" when nothing is configured; callers decide the fallback.
+    """
+    if settings is None:
+        settings = get_app_settings(force_reload=True)
+    return str(
+        os.getenv("SPARKFLOW_DOUYIN_PROXY_URL")
+        or settings.get("douyin_proxy_url", DEFAULT_APP_SETTINGS["douyin_proxy_url"])
+    ).strip()
 
 
 def save_app_settings(new_settings):
     global appSettings
-    appSettings = _merge_defaults(new_settings, DEFAULT_APP_SETTINGS)
-    if not appSettings.get("session_secret"):
-        appSettings["session_secret"] = secrets.token_urlsafe(32)
-    if not appSettings.get("compose_root"):
-        appSettings["compose_root"] = default_compose_root()
-    _save_json_file(app_settings_path(), appSettings)
+    updated = _merge_defaults(new_settings, DEFAULT_APP_SETTINGS)
+    if not updated.get("session_secret"):
+        updated["session_secret"] = secrets.token_urlsafe(32)
+    if not updated.get("compose_root"):
+        updated["compose_root"] = default_compose_root()
+    with FileLock(f"{app_settings_path()}.lock", timeout=30):
+        _save_json_file(app_settings_path(), updated)
+    appSettings = updated
     return deepcopy(appSettings)

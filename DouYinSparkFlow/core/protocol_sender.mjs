@@ -1,24 +1,67 @@
 #!/usr/bin/env node
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { Blob } from "node:buffer";
+import { pathToFileURL } from "node:url";
 
-const SDK_BUNDLES = [
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/lib-polyfill.f81f86eb.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/lib-router.5ab9ff10.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/2105.f8d74876.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/douyin_creator_data_old.2f971672.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/argus-builder-strategy.5a053c46.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/7676.a4cd4900.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/4916.56c33d22.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/8198.b5c0b108.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/4168.b2e72401.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/7771.d27d1891.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/6682.2a991dfb.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/361.4fc40815.js",
-  "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/pages-chat.c817de31.js",
+import { casefold } from "./unicode_casefold.mjs";
+
+export const SDK_BUNDLES = [
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/lib-polyfill.f81f86eb.js",
+    sha256: "9076c568e86629b229e3f81f649d1a83e67d9645c3ba574406c3e6b2a804bc80",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/lib-router.5ab9ff10.js",
+    sha256: "bbf164fe655433eaccfd346d87853b151f64a6391882c56dbc50a449e42095c8",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/2105.f8d74876.js",
+    sha256: "a802f1c74efda6c83b3d26fd84b66980d88ea9bf12e87de1fbef4c6c4741bc4e",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/douyin_creator_data_old.2f971672.js",
+    sha256: "77579ca1db8bd7ee874b27d6eb0691cdb36ef7eb11fb77c53cc81462e719d846",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/argus-builder-strategy.5a053c46.js",
+    sha256: "1e8859043f62711f662f89710ee5e1c2c870af27d55dc174a2d7b09b70e1a121",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/7676.a4cd4900.js",
+    sha256: "38cd5b2be2436fc9ce38b51b53045e4a8a2f05d9a581626b1969ed93722adab0",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/4916.56c33d22.js",
+    sha256: "91e689e17d16f61386604daef544cfcb187fd02abc6885db1e5baf0f08381a7f",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/8198.b5c0b108.js",
+    sha256: "56f7d2477591f3dd4951288354ad71d750a06ab5d7636adfc5640d323e29530d",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/4168.b2e72401.js",
+    sha256: "d33a99a60aca01c0aa269adf112d4e49fc2436d734dd49fd209fa1faf1ec5a40",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/7771.d27d1891.js",
+    sha256: "a96f33881f8fcd329aaa42546b324285efdb1f258419fa259be6bacde25c7c25",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/6682.2a991dfb.js",
+    sha256: "4a63e6279be76182cb937f56587ebc77db91ba328579c238f84d4c8e4330a867",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/361.4fc40815.js",
+    sha256: "02160b7dabc6a8437adb4f417b3975ef1e03058eae87bd72b36a1d8ba20bba78",
+  },
+  {
+    url: "https://lf-fe-creator.douyinstatic.com/obj/douyn-creator-scm-cdn/douyin-creator-mono-pc-data/static/js/async/pages-chat.c817de31.js",
+    sha256: "59ef0c6329bc5606cbf0a003d0836eaff56224caf0627820d5a8fcf11fa5c482",
+  },
 ];
 
 const CREATOR_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat";
@@ -36,7 +79,10 @@ function toCookieString(cookies) {
 }
 
 function normalizeNickname(value) {
-  return String(value || "").trim();
+  return casefold(value)
+    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function stableNow() {
@@ -87,6 +133,13 @@ function sendMessageStatusName(statusCode) {
   return SEND_MESSAGE_STATUS_NAMES[Number(statusCode)] || "Unknown";
 }
 
+export function isSuccessfulSendResult(sendResult) {
+  return (
+    Boolean(sendResult?.success) &&
+    Number(sendResult?.statusCode) === 0
+  );
+}
+
 function publicSendResultSummary(sendResult) {
   if (!sendResult || typeof sendResult !== "object") {
     return {};
@@ -113,24 +166,44 @@ async function readStdinJson() {
   return JSON.parse(raw);
 }
 
+export function sha256Hex(body) {
+  const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body);
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+export function verifyBundleBytes(body, expectedSha256) {
+  const actual = sha256Hex(body);
+  const expected = String(expectedSha256 || "").toLowerCase();
+  if (!expected || actual !== expected) {
+    throw new Error(
+      `Bundle integrity check failed: expected=${expected || "missing"} actual=${actual}`,
+    );
+  }
+  return actual;
+}
+
 async function ensureBundles(cacheDir) {
   await fs.promises.mkdir(cacheDir, { recursive: true });
-  for (const url of SDK_BUNDLES) {
+  for (const bundle of SDK_BUNDLES) {
+    const { url, sha256 } = bundle;
     const filename = url.split("/").at(-1);
     const filePath = path.join(cacheDir, filename);
     if (fs.existsSync(filePath)) {
-      const response = await fetch(url, { method: "HEAD", headers: { "User-Agent": USER_AGENT } });
-      if (!response.ok) {
-        throw new Error(`Cached SDK bundle is stale or unreachable ${url}: ${response.status}`);
+      const cached = await fs.promises.readFile(filePath);
+      try {
+        verifyBundleBytes(cached, sha256);
+        continue;
+      } catch {
+        // A stale or modified cache entry is replaced only after the download verifies.
       }
-      continue;
     }
     const response = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
     if (!response.ok) {
       throw new Error(`Failed to download SDK bundle ${url}: ${response.status}`);
     }
-    const text = await response.text();
-    await fs.promises.writeFile(filePath, text, "utf8");
+    const body = Buffer.from(await response.arrayBuffer());
+    verifyBundleBytes(body, sha256);
+    await fs.promises.writeFile(filePath, body);
   }
 }
 
@@ -314,19 +387,22 @@ async function fetchJson(url, options = {}) {
   const timeoutMs = options.timeoutMs || 15000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const response = await fetch(url, {
-    ...options,
-    signal: controller.signal,
-  });
-  const text = await response.text();
-  clearTimeout(timer);
-  let data = null;
   try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = null;
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+    return { response, text, data };
+  } finally {
+    clearTimeout(timer);
   }
-  return { response, text, data };
 }
 
 async function fetchSessionIdentity(cookieString, cookieMap) {
@@ -351,16 +427,25 @@ async function fetchSessionIdentity(cookieString, cookieMap) {
     `https://creator.douyin.com/aweme/v1/creator/im/user_token/?${params.toString()}`,
     { headers },
   );
-  if (!response.ok || data?.status_code !== 0 || !data?.user_id) {
+  const userId = extractExactUserId(text);
+  if (!response.ok || data?.status_code !== 0 || !userId) {
     throw new ProtocolError("Failed to resolve creator IM session identity", {
       status: response.status,
       body: text,
     });
   }
   return {
-    userId: String(data.user_id),
+    userId,
     sessionToken: String(data.token || ""),
   };
+}
+
+// JSON.parse turns a numeric 16+ digit user_id into a rounded float, so the
+// UID is read from the raw body text and kept as a decimal string (issue #41).
+export function extractExactUserId(text) {
+  const match = /"user_id"\s*:\s*(?:"(\d{1,32})"|(\d{1,32})(?![\d.eE]))/.exec(String(text || ""));
+  const value = match ? match[1] || match[2] : "";
+  return value && !/^0+$/.test(value) ? value : "";
 }
 
 async function fetchIdentitySecurityToken(cookieString, cookieMap) {
@@ -463,14 +548,17 @@ async function createProtocolClient({ bundleDir, cookieString, cookieMap, userId
         : `${String(this.option.apiUrl).replace(/\/$/, "")}/${String(url).replace(/^\//, "")}`;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 20000);
-      const response = await fetch(fullUrl, {
-        method,
-        headers: this.headers,
-        body: body ? Buffer.from(body) : undefined,
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      return response.arrayBuffer();
+      try {
+        const response = await fetch(fullUrl, {
+          method,
+          headers: this.headers,
+          body: body ? Buffer.from(body) : undefined,
+          signal: controller.signal,
+        });
+        return await response.arrayBuffer();
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     sendByBeacon() {
@@ -540,12 +628,14 @@ async function buildConversationCache({
 
     const peerUserId = stringifyMaybeLong(peer.user_id);
     const secUid = peer.sec_uid || "";
-    if (!peerUserId || !secUid) {
+    if (!peerUserId && !secUid) {
       continue;
     }
 
-    let nickname = normalizeNickname(cachedBySecUid.get(secUid)?.nickname);
-    if (!nickname) {
+    let nickname = normalizeNickname(
+      (secUid && cachedBySecUid.get(secUid)?.nickname) || "",
+    );
+    if (!nickname && secUid) {
       try {
         nickname = await fetchProfileNickname(cookieString, secUid);
       } catch {
@@ -570,46 +660,165 @@ async function buildConversationCache({
     }
   }
 
+  return mergeConversationCache(existingCache, cacheEntries);
+}
+
+export function mergeConversationCache(existingCache, cacheEntries) {
   const deduped = new Map();
-  for (const entry of existingCache || []) {
-    if (!entry?.nickname || !entry?.secUid) {
-      continue;
+  const bySecUid = new Map();
+  const byPeerUserId = new Map();
+
+  function removeEntry(entry) {
+    const secUid = String(entry?.secUid || "").trim();
+    const peerUserId = String(entry?.peerUserId || "").trim();
+    if (secUid) {
+      bySecUid.delete(secUid);
     }
-    deduped.set(entry.secUid, entry);
+    if (peerUserId) {
+      byPeerUserId.delete(peerUserId);
+    }
+  }
+
+  function addEntry(entry) {
+    const secUid = String(entry?.secUid || "").trim();
+    const peerUserId = String(entry?.peerUserId || "").trim();
+    if (!entry?.nickname || (!secUid && !peerUserId)) {
+      return;
+    }
+    const matches = [];
+    for (const candidate of [
+      secUid && bySecUid.get(secUid),
+      peerUserId && byPeerUserId.get(peerUserId),
+    ]) {
+      if (candidate && !matches.includes(candidate)) {
+        matches.push(candidate);
+      }
+    }
+    const merged = {};
+    for (const existing of [...matches, entry]) {
+      for (const field of [
+        "nickname",
+        "secUid",
+        "peerUserId",
+        "conversationId",
+        "conversationShortId",
+        "updatedAt",
+      ]) {
+        const value = String(existing[field] || "").trim();
+        if (value) {
+          merged[field] = existing[field];
+        }
+      }
+    }
+    for (const existing of matches) {
+      removeEntry(existing);
+      for (const [key, value] of deduped) {
+        if (value === existing) {
+          deduped.delete(key);
+        }
+      }
+    }
+    const mergedSecUid = String(merged.secUid || "").trim();
+    const mergedPeerUserId = String(merged.peerUserId || "").trim();
+    const key = mergedSecUid
+      ? `sec:${mergedSecUid}`
+      : `peer:${mergedPeerUserId}`;
+    deduped.set(key, merged);
+    if (mergedSecUid) {
+      bySecUid.set(mergedSecUid, merged);
+    }
+    if (mergedPeerUserId) {
+      byPeerUserId.set(mergedPeerUserId, merged);
+    }
+  }
+
+  for (const entry of existingCache || []) {
+    addEntry(entry);
   }
   for (const entry of cacheEntries) {
-    if (!entry.nickname) {
-      continue;
-    }
-    deduped.set(entry.secUid, entry);
+    addEntry(entry);
   }
   return Array.from(deduped.values()).sort((left, right) =>
     left.nickname.localeCompare(right.nickname, "zh-CN"),
   );
 }
 
-function buildTargetLookup(cacheEntries) {
-  const byNickname = new Map();
-  for (const entry of cacheEntries) {
-    const key = normalizeNickname(entry.nickname);
-    if (key && !byNickname.has(key)) {
-      byNickname.set(key, entry);
-    }
+function addUniqueLookupEntry(lookup, key, entry) {
+  const normalized = String(key || "").trim();
+  if (!normalized) {
+    return;
   }
-  return byNickname;
+  if (lookup.has(normalized) && lookup.get(normalized) !== entry) {
+    lookup.set(normalized, null);
+    return;
+  }
+  lookup.set(normalized, entry);
 }
 
-async function sendMessages({
+
+export function buildTargetLookup(cacheEntries) {
+  const byNickname = new Map();
+  const bySecUid = new Map();
+  const byPeerUserId = new Map();
+  for (const entry of cacheEntries) {
+    const key = normalizeNickname(entry.nickname);
+    addUniqueLookupEntry(byNickname, key, entry);
+    addUniqueLookupEntry(bySecUid, entry.secUid, entry);
+    addUniqueLookupEntry(byPeerUserId, entry.peerUserId, entry);
+  }
+  return { byNickname, bySecUid, byPeerUserId };
+}
+
+
+export function resolveTargetMapping(lookup, target, identity = {}) {
+  if (identity.ambiguous) {
+    return { mapping: null, reason: "ambiguous_target" };
+  }
+  const secUid = String(identity.secUid || "").trim();
+  if (secUid) {
+    const mapping = lookup.bySecUid.get(secUid);
+    return {
+      mapping: mapping || null,
+      reason: mapping ? "stable_sec_uid" : "stable_identity_not_found",
+    };
+  }
+  const peerUserId = String(identity.peerUserId || "").trim();
+  if (peerUserId) {
+    const mapping = lookup.byPeerUserId.get(peerUserId);
+    return {
+      mapping: mapping || null,
+      reason: mapping ? "stable_peer_user_id" : "stable_identity_not_found",
+    };
+  }
+
+  const nickname = normalizeNickname(target);
+  const mapping = lookup.byNickname.get(nickname);
+  if (mapping) {
+    return { mapping, reason: "unique_nickname" };
+  }
+  return {
+    mapping: null,
+    reason: lookup.byNickname.has(nickname)
+      ? "ambiguous_target"
+      : "conversation_not_found",
+  };
+}
+
+export async function sendMessages({
   client,
   cacheEntries,
   messagesByTarget,
+  targetIdentities,
   dryRun,
   cookieString,
   cookieMap,
   sendStrategy,
+  personalSendDeadlineEpochMs = null,
+  identityOverride = null,
 }) {
   if (!dryRun) {
-    const identity = await fetchIdentitySecurityToken(cookieString, cookieMap);
+    const identity = identityOverride
+      || await fetchIdentitySecurityToken(cookieString, cookieMap);
     client.updateSendMessageHeaders({
       identity_security_token: identity.identitySecurityHeader,
       identity_security_device_id: identity.realDeviceId,
@@ -617,82 +826,114 @@ async function sendMessages({
     });
   }
 
-  const byNickname = buildTargetLookup(cacheEntries);
+  const lookup = buildTargetLookup(cacheEntries);
   const resolved = [];
   const unresolved = [];
   const sent = [];
+  const skipped = [];
   const normalizedStrategy = normalizeSendStrategy(sendStrategy);
+  const personalDeadline = Number.isFinite(personalSendDeadlineEpochMs)
+    && personalSendDeadlineEpochMs > 0
+    ? personalSendDeadlineEpochMs
+    : null;
 
   for (const [target, message] of Object.entries(messagesByTarget)) {
-    const mapping = byNickname.get(normalizeNickname(target));
-    if (!mapping) {
-      unresolved.push({ target, reason: "conversation_not_found" });
-      continue;
-    }
-
-    const conversation = client.getConversation({ conversationId: mapping.conversationId });
-    if (!conversation) {
-      unresolved.push({ target, reason: "conversation_not_loaded", mapping });
-      continue;
-    }
-
-    resolved.push({
-      target,
-      nickname: mapping.nickname,
-      peerUserId: mapping.peerUserId,
-      conversationId: mapping.conversationId,
-      conversationShortId: mapping.conversationShortId,
-    });
-
-    let delayBeforeSendSeconds = 0;
-    if (!dryRun && sent.length > 0 && normalizedStrategy.messageIntervalSecondsMax > 0) {
-      delayBeforeSendSeconds = randomBetweenInclusive(
-        normalizedStrategy.messageIntervalSecondsMin,
-        normalizedStrategy.messageIntervalSecondsMax,
+    try {
+      const { mapping, reason } = resolveTargetMapping(
+        lookup,
+        target,
+        targetIdentities?.[target] || {},
       );
-      if (delayBeforeSendSeconds > 0) {
-        await sleep(delayBeforeSendSeconds * 1000);
+      if (!mapping) {
+        unresolved.push({ target, reason });
+        continue;
       }
-    }
 
-    const payload = JSON.stringify({ text: message, aweType: 774 });
-    const messageObject = await client.createMessage({
-      type: 7,
-      content: payload,
-      conversation,
-      insert: false,
-    });
+      const conversation = client.getConversation({
+        conversationId: mapping.conversationId,
+      });
+      if (!conversation) {
+        unresolved.push({ target, reason: "conversation_not_loaded", mapping });
+        continue;
+      }
 
-    if (dryRun) {
+      resolved.push({
+        target,
+        nickname: mapping.nickname,
+        peerUserId: mapping.peerUserId,
+        conversationId: mapping.conversationId,
+        conversationShortId: mapping.conversationShortId,
+      });
+
+      let delayBeforeSendSeconds = 0;
+      if (!dryRun && sent.length > 0 && normalizedStrategy.messageIntervalSecondsMax > 0) {
+        delayBeforeSendSeconds = randomBetweenInclusive(
+          normalizedStrategy.messageIntervalSecondsMin,
+          normalizedStrategy.messageIntervalSecondsMax,
+        );
+        if (delayBeforeSendSeconds > 0) {
+          await sleep(delayBeforeSendSeconds * 1000);
+        }
+      }
+
+      const payload = JSON.stringify({ text: message, aweType: 774 });
+      const messageObject = await client.createMessage({
+        type: 7,
+        content: payload,
+        conversation,
+        insert: false,
+      });
+
+      if (dryRun) {
+        sent.push({
+          target,
+          dryRun: true,
+          message,
+          payload,
+          conversationId: mapping.conversationId,
+          delayBeforeSendSeconds,
+        });
+        continue;
+      }
+
+      if (personalDeadline !== null && Date.now() >= personalDeadline) {
+        skipped.push({ target, reason: "personal_window_closed" });
+        continue;
+      }
+
+      const sendResult = await client.sendMessage({ message: messageObject });
+      const statusCode = sendResult?.statusCode ?? null;
       sent.push({
         target,
-        dryRun: true,
+        dryRun: false,
         message,
-        payload,
+        success: isSuccessfulSendResult(sendResult),
+        statusCode,
+        statusName: sendMessageStatusName(statusCode),
+        statusMsg: sendResult?.statusMsg ?? "",
+        sendResultSummary: publicSendResultSummary(sendResult),
         conversationId: mapping.conversationId,
         delayBeforeSendSeconds,
+        sentAt: stableNow(),
       });
-      continue;
+    } catch (error) {
+      sent.push({
+        target,
+        dryRun: false,
+        message,
+        success: false,
+        statusCode: null,
+        statusName: "exception",
+        statusMsg: String(error?.message || error || "protocol target failed"),
+        sendResultSummary: { rawKeys: [] },
+        conversationId: "",
+        delayBeforeSendSeconds: 0,
+        sentAt: stableNow(),
+      });
     }
-
-    const sendResult = await client.sendMessage({ message: messageObject });
-    const statusCode = sendResult?.statusCode ?? null;
-    sent.push({
-      target,
-      dryRun: false,
-      message,
-      success: Boolean(sendResult?.success),
-      statusCode,
-      statusName: sendMessageStatusName(statusCode),
-      statusMsg: sendResult?.statusMsg ?? "",
-      sendResultSummary: publicSendResultSummary(sendResult),
-      conversationId: mapping.conversationId,
-      delayBeforeSendSeconds,
-      sentAt: stableNow(),
-    });
   }
 
-  return { resolved, unresolved, sent };
+  return { resolved, unresolved, sent, skipped };
 }
 
 async function main() {
@@ -723,10 +964,12 @@ async function main() {
     client,
     cacheEntries,
     messagesByTarget: payload.messagesByTarget || {},
+    targetIdentities: payload.targetIdentities || {},
     dryRun: Boolean(payload.dryRun),
     cookieString,
     cookieMap,
     sendStrategy: payload.sendStrategy || {},
+    personalSendDeadlineEpochMs: payload.personalSendDeadlineEpochMs ?? null,
   });
 
   try {
@@ -749,18 +992,24 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.log(
-    JSON.stringify(
-      {
-        ok: false,
-        error: error?.message || String(error),
-        details: error?.details || {},
-        stack: error?.stack || "",
-      },
-      null,
-      2,
-    ),
-  );
-  process.exit(1);
-});
+const isMain =
+  Boolean(process.argv[1]) &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isMain) {
+  main().catch((error) => {
+    console.log(
+      JSON.stringify(
+        {
+          ok: false,
+          error: error?.message || String(error),
+          details: error?.details || {},
+          stack: error?.stack || "",
+        },
+        null,
+        2,
+      ),
+    );
+    process.exit(1);
+  });
+}

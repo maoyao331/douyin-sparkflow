@@ -173,9 +173,9 @@ write_default_cron() {
     echo "DEFAULT_SCHEDULE=$DEFAULT_SCHEDULE will be saved to .env. The initial cron file uses the built-in 10:00-18:00/20m schedule; adjust it from the Web UI after first login." >&2
   fi
   cat > /tmp/douyin-sparkflow-cron <<'CRON'
-*/20 10-17 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
-0 18 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
-20 18 * * * env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 PYTHONUNBUFFERED=1 SPARKFLOW_TRIGGER_LABEL='unsent fallback' bash /app/scripts/run_scheduled_task.sh >> /var/log/douyin-sparkflow.log 2>&1
+*/20 10-17 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /app/logs/douyin-sparkflow.log 2>&1
+0 18 * * * env SPARKFLOW_TRIGGER_LABEL='scheduled send' bash /app/scripts/run_scheduled_task.sh >> /app/logs/douyin-sparkflow.log 2>&1
+20 18 * * * env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 PYTHONUNBUFFERED=1 SPARKFLOW_TRIGGER_LABEL='unsent fallback' bash /app/scripts/run_scheduled_task.sh >> /app/logs/douyin-sparkflow.log 2>&1
 CRON
   run_root cp /tmp/douyin-sparkflow-cron "$cron_file"
   rm -f /tmp/douyin-sparkflow-cron
@@ -186,6 +186,7 @@ prepare_runtime_files() {
   if [ ! -f "$env_file" ]; then
     run_root cp "$APP_ROOT/.env.example" "$env_file"
   fi
+  run_root chmod 600 "$env_file"
 
   set_env_value "$env_file" "APP_ROOT" "$APP_ROOT"
   set_env_value "$env_file" "DEFAULT_SCHEDULE" "$DEFAULT_SCHEDULE"
@@ -210,6 +211,7 @@ prepare_runtime_files() {
   run_root mkdir -p \
     "$APP_ROOT/proxy" \
     "$APP_ROOT/state/cron" \
+    "$APP_ROOT/state/login-api" \
     "$APP_ROOT/state/login-profile" \
     "$APP_ROOT/state/browser-profiles" \
     "$APP_ROOT/DouYinSparkFlow/logs"
@@ -249,15 +251,21 @@ compose_up() {
 
 print_summary() {
   local env_file="$APP_ROOT/.env"
-  local web_port login_port login_bind host_ip
+  local web_port web_bind login_port login_bind host_ip
   web_port="$(read_env_value "$env_file" WEB_PORT)"
+  web_bind="$(read_env_value "$env_file" WEB_BIND_ADDRESS)"
   login_port="$(read_env_value "$env_file" LOGIN_DESKTOP_WEB_PORT)"
   login_bind="$(read_env_value "$env_file" LOGIN_DESKTOP_BIND_ADDRESS)"
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   host_ip="${host_ip:-127.0.0.1}"
   echo
   echo "Douyin SparkFlow is running."
-  echo "Web UI: http://${host_ip}:${web_port:-8787}"
+  if [ "${web_bind:-127.0.0.1}" = "127.0.0.1" ]; then
+    echo "Web UI is local-only: http://127.0.0.1:${web_port:-8787}"
+    echo "Use an HTTPS reverse proxy or SSH tunnel: ssh -L ${web_port:-8787}:127.0.0.1:${web_port:-8787} <user>@${host_ip}"
+  else
+    echo "Web UI: http://${host_ip}:${web_port:-8787}"
+  fi
   if [ "${login_bind:-127.0.0.1}" = "127.0.0.1" ]; then
     echo "Login desktop is local-only: http://127.0.0.1:${login_port:-8788}/vnc.html?autoconnect=1&resize=scale&view_only=0"
     echo "For remote access, create an SSH tunnel: ssh -L ${login_port:-8788}:127.0.0.1:${login_port:-8788} <user>@${host_ip}"

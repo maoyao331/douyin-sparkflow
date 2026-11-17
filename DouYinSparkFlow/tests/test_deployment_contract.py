@@ -7,27 +7,59 @@ SOURCE_ROOT = REPO_ROOT / "DouYinSparkFlow"
 
 
 class DeploymentContractTests(unittest.TestCase):
+    def test_installer_writes_the_scheduled_log_to_the_mounted_path(self):
+        installer = (REPO_ROOT / "deploy" / "install-server.sh").read_text(encoding="utf-8")
+        # The web container reads /app/logs/..., so the scheduler must write that
+        # same file through the shared mount instead of a container-local /var/log.
+        self.assertIn("/app/logs/douyin-sparkflow.log", installer)
+        self.assertNotIn("/var/log/douyin-sparkflow.log", installer)
+
     def test_github_workflow_is_at_repository_root(self):
-        workflow = REPO_ROOT / ".github" / "workflows" / "schedule.yml"
+        workflow = REPO_ROOT / ".github" / "workflows" / "tests.yml"
         self.assertTrue(workflow.is_file())
-        self.assertFalse((SOURCE_ROOT / ".github" / "workflows" / "schedule.yml").exists())
+        self.assertFalse((SOURCE_ROOT / ".github" / "workflows" / "tests.yml").exists())
         text = workflow.read_text(encoding="utf-8")
         self.assertIn("working-directory: DouYinSparkFlow", text)
-        self.assertIn("SPARKFLOW_BROWSER_PROFILE_ROOT", text)
-        self.assertIn("SPARKFLOW_MANUAL_RUN", text)
         self.assertIn('USER_DATA: "[]"', text)
-        self.assertIn("run_task:", text)
-        self.assertGreaterEqual(text.count("github.event_name == 'schedule' || inputs.run_task"), 2)
-        self.assertIn("path: DouYinSparkFlow/logs/", text)
+        self.assertIn('PYTHONPATH: ".:tests"', text)
+        self.assertIn("pip install -r requirements-test.txt", text)
+        self.assertIn("python -m pytest -q --timeout=90 tests", text)
+        tooling = (SOURCE_ROOT / "requirements-test.txt").read_text(encoding="utf-8")
+        self.assertIn("-r requirements.txt", tooling)
+        for package in ("pytest==", "pytest-asyncio==", "pytest-subtests==", "pytest-timeout=="):
+            with self.subTest(package=package):
+                self.assertIn(package, tooling)
+        self.assertIn("node --test DouYinSparkFlow/tests/test_protocol_sender_helpers.mjs", text)
 
     def test_github_actions_are_pinned_to_commit_shas(self):
         import re
 
-        workflow = (REPO_ROOT / ".github" / "workflows" / "schedule.yml").read_text(encoding="utf-8")
-        uses_values = re.findall(r"^\s*-?\s*uses:\s*([^#\s]+)", workflow, flags=re.MULTILINE)
-        self.assertTrue(uses_values)
-        for value in uses_values:
-            self.assertRegex(value, r"^[^@]+@[0-9a-f]{40}$")
+        workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertTrue(workflows)
+        for workflow in workflows:
+            uses_values = re.findall(
+                r"^\s*-?\s*uses:\s*([^#\s]+)",
+                workflow.read_text(encoding="utf-8"),
+                flags=re.MULTILINE,
+            )
+            self.assertTrue(uses_values, workflow.name)
+            for value in uses_values:
+                with self.subTest(workflow=workflow.name, uses=value):
+                    self.assertRegex(value, r"^[^@]+@[0-9a-f]{40}$")
+
+    def test_ci_never_sends_messages_or_reads_secrets(self):
+        # The repository is public: CI must stay a pure verification surface. A
+        # scheduled workflow used to run the real send task from GitHub runners
+        # with account cookies in a secret, which both duplicated the server's
+        # schedule and sent from a foreign IP.
+        for workflow in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+            text = workflow.read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow.name):
+                self.assertNotIn("secrets.", text)
+                self.assertNotIn("--doTask", text)
+                self.assertNotIn("SPARKFLOW_MANUAL_RUN", text)
+                self.assertNotRegex(text, r"(?m)^\s*schedule:\s*$")
+                self.assertNotIn("path: DouYinSparkFlow/logs/", text)
 
     def test_runtime_config_is_not_tracked_as_the_template(self):
         self.assertTrue((SOURCE_ROOT / "config.example.json").is_file())
@@ -51,8 +83,12 @@ class DeploymentContractTests(unittest.TestCase):
         scheduler = text.split("  scheduler:", 1)[1].split("\n  task:", 1)[0]
         task = text.split("  task:", 1)[1]
 
-        self.assertIn("/var/run/docker.sock:/var/run/docker.sock", web)
-        self.assertIn(".:/opt/douyin-sparkflow", web)
+        self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", web)
+        self.assertNotIn(".:/opt/douyin-sparkflow", web)
+        self.assertIn("${WEB_BIND_ADDRESS:-127.0.0.1}", web)
+        for service in (web, scheduler, task):
+            self.assertIn("no-new-privileges:true", service)
+            self.assertIn("cap_drop: [ALL]", service)
         self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", scheduler)
         self.assertNotIn(".:/opt/douyin-sparkflow", scheduler)
         self.assertNotIn("/var/run/docker.sock:/var/run/docker.sock", task)
@@ -86,7 +122,7 @@ class DeploymentContractTests(unittest.TestCase):
             "20 18 * * * /bin/bash -lc 'docker ps --format \"{{.Names}}\" | "
             "grep douyin-web; docker exec douyin-web sh -lc \"cd /app && "
             "env SPARKFLOW_MANUAL_RUN=1 SPARKFLOW_MANUAL_UNSENT_ONLY=1 "
-            "python main.py --doTask\"' >> /var/log/douyin-sparkflow.log 2>&1"
+            "python main.py --doTask\"' >> /app/logs/douyin-sparkflow.log 2>&1"
         )
         migrated = migrate_legacy_line(legacy)
 
@@ -146,10 +182,34 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn("node --version", dockerfile)
         self.assertNotIn("github.com/docker/compose", dockerfile)
 
+    def test_playwright_defaults_use_the_multi_architecture_upstream_image(self):
+        upstream = "mcr.microsoft.com/playwright/python:v1.56.0-jammy"
+        mirror = "swr.cn-north-4.myhuaweicloud.com/ddn-k8s/mcr.microsoft.com/playwright/python:v1.56.0-jammy"
+        dockerfile = (SOURCE_ROOT / "Dockerfile.server").read_text(encoding="utf-8")
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn(f"ARG PLAYWRIGHT_BASE_IMAGE={upstream}", dockerfile)
+        self.assertIn(f"PLAYWRIGHT_BASE_IMAGE: ${{PLAYWRIGHT_BASE_IMAGE:-{upstream}}}", compose)
+        self.assertIn(f"PLAYWRIGHT_BASE_IMAGE={upstream}", env_example)
+        self.assertNotIn(mirror, compose)
+        self.assertNotIn(mirror, env_example)
+        self.assertIn("Apple Silicon", readme)
+        self.assertIn("PLAYWRIGHT_BASE_IMAGE", readme)
+
     def test_docker_build_context_excludes_runtime_data(self):
         dockerignore = (SOURCE_ROOT / ".dockerignore").read_text(encoding="utf-8")
-        for entry in ("logs/", "config.json", "usersData.json", "webui_settings.json"):
+        for entry in ("logs/", "config.json", "usersData.json", "webui_settings.json", "webui_users.json", "webui_passkeys.json", ".data-backups/", "*.key"):
             self.assertIn(entry, dockerignore)
+
+    def test_login_desktop_has_no_platform_database_or_storage_key_mount(self):
+        compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        desktop = compose.split("  login-desktop:", 1)[1].split("  scheduler:", 1)[0]
+        self.assertNotIn("./DouYinSparkFlow:/app", desktop)
+        self.assertNotIn("./DouYinSparkFlow/logs:/app/logs", desktop)
+        self.assertNotIn("/run/storage-key", desktop)
+        self.assertNotIn("SPARKFLOW_STORAGE_KEY_FILE", desktop)
 
     def test_login_desktop_uses_direct_first_network_route(self):
         compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
@@ -165,9 +225,9 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn('"--no-proxy-server"', server)
         self.assertIn('"/preflight"', server)
         self.assertIn('LOGIN_DESKTOP_PROXY_MODE: ${LOGIN_DESKTOP_PROXY_MODE:-auto}', login_block)
-        dashboard = (SOURCE_ROOT / "webui" / "templates" / "dashboard.html").read_text(encoding="utf-8")
-        self.assertIn('name="douyin_network_mode"', dashboard)
-        self.assertIn('name="douyin_proxy_url"', dashboard)
+        settings_page = (SOURCE_ROOT / "webui" / "templates" / "settings.html").read_text(encoding="utf-8")
+        self.assertIn('name="douyin_network_mode"', settings_page)
+        self.assertIn('name="douyin_proxy_url"', settings_page)
         browser = (SOURCE_ROOT / "core" / "browser.py").read_text(encoding="utf-8")
         self.assertIn("--no-proxy-server", browser)
         self.assertIn("SPARKFLOW_DOUYIN_NETWORK_MODE", browser)
@@ -176,7 +236,10 @@ class DeploymentContractTests(unittest.TestCase):
         compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         start_script = (SOURCE_ROOT / "scripts" / "start_login_desktop.sh").read_text(encoding="utf-8")
         server = (SOURCE_ROOT / "login_desktop_server.py").read_text(encoding="utf-8")
-        self.assertIn("cpus: ${LOGIN_DESKTOP_CPUS:-0.8}", compose)
+        # A login run drives Chromium, Xvfb, x11vnc and noVNC at once; 0.8 CPU
+        # starved the whole flow on a two-core host, so the default is 1.5 and
+        # stays overridable through LOGIN_DESKTOP_CPUS.
+        self.assertIn("cpus: ${LOGIN_DESKTOP_CPUS:-1.5}", compose)
         self.assertIn("mem_limit: ${LOGIN_DESKTOP_MEMORY_LIMIT:-1200m}", compose)
         self.assertIn("pids_limit: ${LOGIN_DESKTOP_PIDS_LIMIT:-256}", compose)
         self.assertIn("-nap -wait 50 -defer 50", start_script)
@@ -186,6 +249,15 @@ class DeploymentContractTests(unittest.TestCase):
         self.assertIn('reduced_motion="reduce"', server)
         self.assertIn('"/creator-micro/" in page.url', server)
         self.assertIn('"qr_ready": qr_ready', server)
+
+    def test_login_desktop_novnc_metadata_is_repaired_before_websockify(self):
+        start_script = (SOURCE_ROOT / "scripts" / "start_login_desktop.sh").read_text(encoding="utf-8")
+        command = "python /app/scripts/ensure_novnc_metadata.py --web-root /usr/share/novnc"
+        websockify = 'run_forever novnc websockify --web=/usr/share/novnc'
+
+        self.assertIn(command, start_script)
+        self.assertIn(f"if ! {command}; then", start_script)
+        self.assertLess(start_script.index(command), start_script.index(websockify))
 
     def test_login_desktop_uses_fastapi_lifespan(self):
         server = (SOURCE_ROOT / "login_desktop_server.py").read_text(encoding="utf-8")

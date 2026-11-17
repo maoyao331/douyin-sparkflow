@@ -1,11 +1,9 @@
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from webui import login_lock, users
-from webui.auth import hash_password
 
 
 class MultiUserTests(unittest.TestCase):
@@ -53,6 +51,15 @@ class MultiUserTests(unittest.TestCase):
         self.assertEqual([second_ref], users.find_web_user("zxb")["account_refs"])
         self.assertTrue(users.delete_web_user("zxb"))
         self.assertEqual([], users.get_web_users())
+
+    def test_account_owner_lookup_distinguishes_unassigned(self):
+        accounts, _ = users.ensure_account_refs(self.accounts)
+        first_ref = accounts[0]["account_ref"]
+        self.assertEqual("", users.account_owner_username(first_ref))
+        users.create_web_user("zxb", "secret", account_refs=[first_ref])
+        self.assertEqual("zxb", users.account_owner_username(first_ref))
+        self.assertEqual("", users.account_owner_username("acc-missing"))
+        self.assertEqual("", users.account_owner_username(""))
 
     def test_fifo_queue_promotes_after_active_release(self):
         with patch.object(login_lock, "LOCK_PATH", self.lock_path):

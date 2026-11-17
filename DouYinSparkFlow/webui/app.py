@@ -1,12 +1,16 @@
 import asyncio
 import json
 import logging
+import hmac
 import os
+import secrets
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import urllib.error
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -14,24 +18,58 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from filelock import Timeout as StorageLockTimeout
 
-from core.friends import fetch_account_friends
+from core import identity as account_identity
+from core import streak_state
+from core.browser_engine import fingerprint_browser_enabled, resolve_browser_engine
+from core.cookies import (
+    CookieParseError,
+    cookie_summary,
+    parse_cookie_input,
+    require_auth_cookies,
+)
+from core.groups import fetch_account_groups
+from core.friends import (
+    CATEGORY_EMPTY_RESULT,
+    CATEGORY_INCOMPLETE_SCAN,
+    CATEGORY_LABELS,
+    CATEGORY_LOGIN_REQUIRED,
+    CATEGORY_NETWORK_UNAVAILABLE,
+    CATEGORY_STRUCTURE_CHANGED,
+    FriendRefreshError,
+    fetch_account_friends,
+    verify_account_session,
+)
+from core import friend_identity
+from core import patrol as account_patrol
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
-from core.tasks import run_browser_tasks, task_run_lock
+from core.protocol_dispatch import run_protocol_tasks
+from core.tasks import (
+    _normalize_target_name,
+    _append_streak_run_report,
+    parse_chat_target,
+    target_match_key,
+    record_friend_scan,
+    run_browser_tasks,
+    task_run_lock,
+)
 from utils.config import (
     get_app_settings,
     get_config,
     get_userData,
     normalize_unique_id,
     save_app_settings,
-    save_config,
-    save_userData,
-    upsert_user_account,
+    update_config,
+    update_user_data,
 )
+from utils import notify
+from utils.logger import setup_logger
 from webui.auth import (
+    BootstrapAlreadyConfigured,
     bootstrap_admin_password,
     clear_session,
     csrf_token,
@@ -40,15 +78,15 @@ from webui.auth import (
     is_bootstrapped,
     is_https_request,
     issue_session,
+    refreshed_identity,
     update_admin_password,
     validate_csrf,
-    verify_password,
 )
 from webui.users import (
     UserStoreError,
     account_by_ref,
     account_by_unique_id,
-    all_assigned_refs,
+    account_owner_username,
     can_access_account,
     create_web_user,
     delete_web_user,
@@ -58,6 +96,24 @@ from webui.users import (
     remove_account_refs_from_users,
     update_web_user,
 )
+from webui.login_guard import LoginThrottle, password_problem
+from webui.security import SecurityMiddleware
+from webui.credentials import CredentialBusyError, credential_slot, run_auth_read, run_credential_work
+from utils.secure_storage import StorageError
+from utils.secure_storage import require_encrypted_files
+from webui import registration
+from webui.registration_routes import register_routes as register_registration_routes
+from webui.login_interaction import register_routes as register_login_interaction_routes
+from webui.personal_streak import register_routes as register_personal_streak_routes
+from webui.personal_streak import schedule_for as personal_schedule_for
+from webui.static_assets import AssetVersions, public_assets
+from webui.picker_data import picker_cache
+from webui.binding_operations import BindingOperations, ID_PATTERN
+from webui.account_binding import BindingCommitError, commit_login_binding, capture_login_before_write
+from webui.account_binding import register_routes as register_account_binding_routes
+from webui.account_editing import AccountEditConflict, account_edit_revision
+from webui.passkeys import PasskeyStore, login_identity as passkey_identity
+from webui.passkey_routes import register_passkey_routes
 from webui.login_lock import (
     begin_expiration as begin_login_expiration,
     begin_force_reset as begin_login_force_reset,
@@ -75,25 +131,46 @@ from webui.ops import (
     TASK_ALREADY_RUNNING,
     get_overview_snapshot,
     get_ops_snapshot,
+    get_host_status_snapshot,
+    HostStatusBusy,
+    cache_age_label,
+    duplicate_display_names,
+    identity_view,
+    log_file_path,
+    resolve_log_file,
     read_log_tail,
-    refresh_proxy,
-    restart_proxy,
+    summarize_log_tail,
     run_failed_retry_now,
     run_task_now,
     run_unsent_retry_now,
     task_run_lock_status,
+    preview_daily_schedule,
+    schedule_window_state,
     sync_daily_schedule_from_config,
     update_daily_schedule,
 )
 
-logger = logging.getLogger(__name__)
+# Route web-side warnings into the same logs/app.log the task runner writes, at
+# the level it already uses, so a failed refresh is no longer silent.
+logger = setup_logger(level=logging.DEBUG)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
+asset_versions = AssetVersions(STATIC_DIR)
 DEBUG_ARTIFACTS_DIR = BASE_DIR.parent / "logs" / "debug_artifacts"
+# Seconds one /login-desktop/qr request waits upstream for a QR code; the upstream
+# adds at most ~3s on top, well inside the 20s proxy timeout.
+LOGIN_QR_WAIT_SECONDS = 10
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates.env.globals["asset_url"] = asset_versions.url
+templates.env.globals["cache_age_label"] = cache_age_label
+templates.env.globals["duplicate_display_names"] = duplicate_display_names
+templates.env.globals["schedule_window_state"] = lambda: schedule_window_state(allow_host_commands=False)
+templates.env.globals["identity_view"] = identity_view
+templates.env.globals["patrol_view"] = account_patrol.patrol_view
+templates.env.globals["account_edit_revision"] = account_edit_revision
 
 
 def _dedupe_targets(values):
@@ -101,9 +178,14 @@ def _dedupe_targets(values):
     result = []
     for value in values:
         normalized = str(value).strip()
-        if not normalized or normalized in seen:
+        dedupe_key = (
+            target_match_key(normalized)
+            if normalized.startswith(("群聊：", "群聊:"))
+            else ("friend", normalized)
+        )
+        if not normalized or dedupe_key in seen:
             continue
-        seen.add(normalized)
+        seen.add(dedupe_key)
         result.append(normalized)
     return result
 
@@ -125,102 +207,39 @@ def extract_targets_from_form(form):
     return _split_target_entries([raw_targets])
 
 
-def find_account(accounts, unique_id):
-    normalized = normalize_unique_id(unique_id)
-    for account in accounts:
-        if normalize_unique_id(account.get("unique_id")) == normalized:
-            return account
-    return None
+def extract_group_targets_from_form(form):
+    """Return manual group targets in the canonical, separate namespace."""
+    values = form.getlist("group_targets") if hasattr(form, "getlist") else [form.get("group_targets", "")]
+    normalized = []
+    for value in _split_target_entries(values):
+        name = value.removeprefix("群聊：").removeprefix("群聊:").strip()
+        if name:
+            normalized.append(f"群聊：{name}")
+    return _dedupe_targets(normalized)
 
 
-def is_account_enabled(account):
-    return bool(account.get("enabled", True))
+from webui.app_helpers import (
+    _history_entry_strong_confirmed_today,
+    _parse_sent_at,
+    _schedule_timezone,
+    _target_sent_today,
+    _target_unconfirmed_today,
+    coerce_int,
+    find_account,
+    is_account_enabled,
+    manual_retry_config,
+    mark_target_unconfirmed,
+)  # noqa: F401
 
 
-def coerce_int(value, default, minimum=0):
-    try:
-        return max(minimum, int(str(value).strip()))
-    except (TypeError, ValueError):
-        return max(minimum, int(default))
+def manual_retry_channel(config):
+    """Sender a manual retry must use, mirroring ``_split_sender_modes``.
 
-
-def _schedule_timezone():
-    return timezone(timedelta(hours=8), name="Asia/Shanghai")
-
-
-def _parse_sent_at(raw_value):
-    return parse_sent_at(raw_value, _schedule_timezone())
-
-
-def _history_entry_strong_confirmed_today(entry):
-    return history_entry_is_strong_confirmed_today(
-        entry,
-        datetime.now(_schedule_timezone()),
-    )
-
-
-def _target_sent_today(account, target_name):
-    entry = dict(account.get("message_history") or {}).get(target_name) or {}
-    return _history_entry_strong_confirmed_today(entry)
-
-
-def _target_unconfirmed_today(account, target_name):
-    entry = dict(account.get("message_history") or {}).get(target_name) or {}
-    sent_at = _parse_sent_at(entry.get("sentAt"))
-    if sent_at and sent_at.date() == datetime.now(_schedule_timezone()).date() and not _history_entry_strong_confirmed_today(entry):
-        return True
-    failure_entry = dict(account.get("failure_queue") or {}).get(target_name) or {}
-    last_attempt_at = _parse_sent_at(failure_entry.get("lastAttemptAt"))
-    return bool(
-        last_attempt_at
-        and last_attempt_at.date() == datetime.now(_schedule_timezone()).date()
-        and str(failure_entry.get("category") or "") == "send_unconfirmed"
-    )
-
-
-def mark_target_unconfirmed(account, target_name, *, reason="manual_reset_possible_false_positive", force=False):
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    history = dict(account.get("message_history") or {})
-    existing = dict(history.get(target_name) or {})
-    sent_at = _parse_sent_at(existing.get("sentAt"))
-    today = datetime.now(_schedule_timezone()).date()
-    if existing and sent_at and sent_at.date() != today and not force:
-        return False
-    if existing and _history_entry_strong_confirmed_today(existing) and not force:
-        return False
-
-    previous_status = existing.get("status") or ("legacy_sentAt_only" if existing else "missing_history")
-    message = str(existing.get("message") or "")
-    history[target_name] = {
-        **existing,
-        "message": message,
-        "sentAt": existing.get("sentAt") or now,
-        "status": "unconfirmed",
-        "confirmationLevel": existing.get("confirmationLevel") or "legacy",
-        "confirmationSource": existing.get("confirmationSource") or "manual_reset",
-        "confirmationDetail": existing.get("confirmationDetail") or "已手动标记为待核验/待补发。",
-        "needsVerification": True,
-        "resetAt": now,
-        "resetReason": reason,
-        "previousStatus": previous_status,
-    }
-    account["message_history"] = history
-
-    queue = dict(account.get("failure_queue") or {})
-    existing_failure = dict(queue.get(target_name) or {})
-    queue[target_name] = {
-        "category": "send_unconfirmed",
-        "reason": reason,
-        "message": message,
-        "firstAttemptAt": existing_failure.get("firstAttemptAt") or now,
-        "lastAttemptAt": now,
-        "attemptCount": int(existing_failure.get("attemptCount") or 0) + 1,
-        "lastRunMode": "manual_reset",
-        "confirmationLevel": history[target_name].get("confirmationLevel"),
-        "confirmationSource": history[target_name].get("confirmationSource"),
-    }
-    account["failure_queue"] = queue
-    return True
+    A retry that always drove the browser would contradict a protocol-primary
+    deployment and record evidence the operator cannot trust, so the channel is
+    derived from the same switch the scheduled run uses.
+    """
+    return "protocol" if config.get("useProtocolSender", True) else "browser"
 
 
 def login_desktop_api_url():
@@ -233,6 +252,8 @@ def login_desktop_display_mode() -> str:
     settings = get_app_settings(force_reload=True)
     configured = os.getenv("SPARKFLOW_LOGIN_DESKTOP_MODE") or settings.get("login_desktop_mode")
     mode = str(configured or ("native" if os.name == "nt" else "novnc")).strip().lower()
+    if mode == "native" and os.name != "nt":
+        return "novnc"
     return mode if mode in {"native", "novnc"} else "novnc"
 
 
@@ -243,7 +264,8 @@ def login_desktop_public_url(request: Request) -> str:
         or settings.get("login_desktop_public_url")
         or ""
     ).strip()
-    if configured_url:
+    shared = str(os.getenv("SPARKFLOW_SHARED_MODE", "")).lower() in {"1", "true", "yes", "on"}
+    if configured_url and not shared:
         return configured_url
     if login_desktop_display_mode() == "native":
         return ""
@@ -261,6 +283,20 @@ def login_desktop_novnc_http_url() -> str:
 
 def login_desktop_novnc_ws_url() -> str:
     return str(os.getenv("SPARKFLOW_LOGIN_DESKTOP_NOVNC_WS_URL") or "ws://login-desktop:6080/websockify")
+
+
+def login_desktop_api_headers():
+    token = str(os.getenv("SPARKFLOW_LOGIN_DESKTOP_API_TOKEN") or "").strip()
+    if not token:
+        token_file = str(
+            os.getenv("SPARKFLOW_LOGIN_DESKTOP_API_TOKEN_FILE") or ""
+        ).strip()
+        if token_file:
+            try:
+                token = Path(token_file).read_text(encoding="utf-8").strip()
+            except OSError:
+                token = ""
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def fetch_login_desktop_asset(asset_path: str, query: str = ""):
@@ -281,10 +317,44 @@ def fetch_login_desktop_asset(asset_path: str, query: str = ""):
         raise RuntimeError(f"login-desktop noVNC proxy failed: {exc}") from exc
 
 
+def call_login_desktop_json(path: str, *, method: str = "GET", payload: dict | None = None, timeout: int = 20, max_bytes=None):
+    """Call the login-desktop API and keep the upstream status and body."""
+    url = f"{login_desktop_api_url()}{path}"
+    data = None
+    headers = login_desktop_api_headers()
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    request = urllib.request.Request(url, method=method, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_body = response.read(max_bytes + 1) if max_bytes else response.read()
+            if max_bytes and len(raw_body) > max_bytes:
+                raise RuntimeError("login-desktop response exceeded its limit")
+            body = raw_body.decode("utf-8", errors="replace")
+            status = int(getattr(response, "status", 200))
+    except urllib.error.HTTPError as exc:
+        raw_body = exc.read(max_bytes + 1) if max_bytes else exc.read()
+        if max_bytes and len(raw_body) > max_bytes:
+            raise RuntimeError("login-desktop response exceeded its limit")
+        body = raw_body.decode("utf-8", errors="replace")
+        status = int(exc.code)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(f"login-desktop unavailable: {reason}") from exc
+    try:
+        parsed = json.loads(body) if body.strip() else {}
+    except ValueError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    return status, parsed
+
+
 def call_login_desktop(path: str, *, method: str = "GET", payload: dict | None = None, timeout: int = 20) -> dict:
     url = f"{login_desktop_api_url()}{path}"
     data = None
-    headers = {}
+    headers = login_desktop_api_headers()
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json; charset=utf-8"
@@ -330,59 +400,800 @@ async def _run_websocket_relays(*coroutines):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _dedupe_account_records(accounts: list[dict], *, unique_id: str, keep_ref: str) -> set[str]:
+_FRIEND_REFRESH_TIMEOUT_SECONDS = 300
+# Background login verification (D12): poll for a free browser, give up
+# waiting after two hours, bound one check, and wait a little after a restart.
+LOGIN_VERIFICATION_IDLE_POLL_SECONDS = 15
+LOGIN_VERIFICATION_MAX_WAIT_SECONDS = 2 * 3600
+LOGIN_VERIFICATION_TIMEOUT_SECONDS = 300
+LOGIN_VERIFICATION_RESTART_DELAY_SECONDS = 30
+_friend_refresh_active = set()
+_group_refresh_active = set()
+# Accounts with a Web-triggered patrol in flight (one uvicorn process).
+_patrol_active = set()
+_background_tasks = set()
+
+
+def _start_background(coro):
+    """Run a Web-triggered job in the background of the serving event loop."""
+    task = asyncio.create_task(coro)
+    # Keep a reference so the loop does not drop the task before it finishes.
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def friend_refresh_conflict(unique_id):
+    """Return a conflict reason when this account already has a refresh running."""
+    if normalize_unique_id(unique_id) in _friend_refresh_active:
+        return "该账号已有好友刷新正在进行，请稍后重试"
+    if normalize_unique_id(unique_id) in _patrol_active:
+        return "该账号正在巡查，请稍后重试"
+    if normalize_unique_id(unique_id) in _group_refresh_active:
+        return "该账号正在刷新群列表，请稍后重试"
+    active = get_login_lock()
+    if active:
+        return "登录工作区正在被使用，请等扫码登录结束后再刷新好友"
+    return ""
+
+
+def _incomplete_scan_message(reason):
+    """Explain a read that stopped before the end of the friend list."""
+    detail = f"（{reason}）" if reason else ""
+    return f"本次读取不完整，已保留上一次的好友数据；请稍后重试。{detail}"
+
+
+def _incomplete_scan_fields(reason):
+    """Shared result fields for any read that stopped before the list ended.
+
+    Both the synchronous route and the background job must classify a stalled
+    scan and a read that ran past its budget the same way.
+    """
+    return {
+        "error": _incomplete_scan_message(reason),
+        "category": CATEGORY_INCOMPLETE_SCAN,
+        "categoryLabel": CATEGORY_LABELS[CATEGORY_INCOMPLETE_SCAN],
+        "retryable": True,
+    }
+
+
+# A save never removes or merges other account rows (issue #41 A3/A4): only an
+# explicit user delete or merge may do that. Health clearing is shared with the
+# CLI save through core.identity so both paths lift exactly the same flags.
+HEALTH_CLEARING_KEYS = account_identity.LOGIN_HEALTH_FLAG_KEYS
+LOGIN_RELATED_FAILURE_CATEGORIES = account_identity.LOGIN_RELATED_FAILURE_CATEGORIES
+
+
+def _clear_login_health(account):
+    account_identity.clear_login_health(account)
+
+
+def write_login_verification(
+    account_ref,
+    token,
+    outcome,
+    *,
+    category="",
+    reason="",
+    expected_uid="",
+    actual_uid="",
+    generation="",
+):
+    """Record a background login check on the account it was started for.
+
+    outcome is "verified", "login_required", "identity_conflict" or
+    "unverified". The token (and, for a new save, the login generation) ties the
+    result to the save that queued it, so a stale check never touches a newer
+    login. Records written before generations existed only carry the token and
+    are still accepted on the token alone.
+    """
+    def mutate(accounts):
+        target = account_by_ref(accounts, account_ref)
+        current = dict((target or {}).get("login_verification") or {})
+        if not target or not token or current.get("token") != token:
+            # Deleted meanwhile, or a newer login replaced this one.
+            return None, False
+        if generation:
+            # A CLI save (or any newer login) that kept the same token but moved
+            # to a new generation must not be judged by this stale result.
+            if account_identity.account_login_generation(target) != generation:
+                return None, False
+        finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if outcome == "verified":
+            # Only lift this check's own marker. The save already cleared the old
+            # health flags; anything written since (an identity mismatch, a real
+            # send failure today) is newer and must stay.
+            target.pop("login_verification", None)
+        elif outcome == "identity_conflict":
+            if expected_uid and account_identity.account_uid(target) != expected_uid:
+                # The binding changed since this check started; not ours to judge.
+                return None, False
+            target["identity_mismatch"] = {
+                "kind": "platform_uid",
+                "expected": expected_uid,
+                "actual": actual_uid,
+                "detectedAt": finished_at,
+                "reason": "saved login belongs to a different platform UID",
+            }
+            target["login_verification"] = {
+                "state": "identity_conflict",
+                "token": token,
+                "finishedAt": finished_at,
+                "category": account_identity.CATEGORY_IDENTITY_CONFLICT,
+                "reason": reason,
+            }
+        elif outcome == "login_required":
+            target["login_required"] = True
+            health = dict(target.get("account_health") or {})
+            health.update(
+                {
+                    "healthy": False,
+                    "category": category or CATEGORY_LOGIN_REQUIRED,
+                    "reason": reason or "登录态已失效，需要重新登录",
+                }
+            )
+            target["account_health"] = health
+            target["login_verification"] = {
+                "state": "login_required",
+                "token": token,
+                "finishedAt": finished_at,
+                "reason": reason,
+            }
+        else:
+            # Not confirmed either way (network, page or identity endpoint):
+            # shown on the account, but sending is not paused for it.
+            target["login_verification"] = {
+                "state": "unverified",
+                "token": token,
+                "finishedAt": finished_at,
+                "category": category,
+                "reason": reason,
+            }
+        return dict(target), True
+
+    return update_user_data(mutate, force_reload=True)
+
+
+
+async def check_saved_login_identity(account):
+    """After a usable login, check it still belongs to the record's bound UID.
+
+    Returns ``(outcome, category, reason, expected_uid, actual_uid)``. A usable
+    login is not proof of the right account; an unreadable identity is shown
+    but does not pause sending; a legacy record (no bound UID) is not judged.
+    """
+    expected_uid = account_identity.account_uid(account)
+    if not expected_uid:
+        return "verified", "", "", "", ""
+    try:
+        trusted = await asyncio.to_thread(
+            account_identity.fetch_trusted_identity,
+            list(account.get("cookies") or []),
+        )
+    except account_identity.IdentityUnavailable as exc:
+        return "unverified", account_identity.CATEGORY_IDENTITY_UNVERIFIED, str(exc), expected_uid, ""
+    if trusted["uid"] != expected_uid:
+        return (
+            "identity_conflict",
+            account_identity.CATEGORY_IDENTITY_CONFLICT,
+            "保存的登录属于另一个平台 UID",
+            expected_uid,
+            trusted["uid"],
+        )
+    return "verified", "", "", expected_uid, trusted["uid"]
+
+def find_same_name_account(accounts, username):
+    """Accounts sharing a nickname, used to ask before adding a duplicate.
+
+    Douyin nicknames are not unique, so this only narrows the candidates down;
+    the operator still decides whether to update the existing row or create a
+    separate account.
+    """
+    wanted = str(username or "").strip()
+    if not wanted:
+        return []
+    return [
+        item
+        for item in accounts or []
+        if str((item or {}).get("username") or "").strip() == wanted
+    ]
+
+
+def unique_id_owned_by_other(accounts, unique_id, current):
+    """True when another Web user owns any row for this stored key.
+
+    Duplicate rows for one ``unique_id`` are legacy data. The save path updates
+    one row and then dedupes the rest, so the permission check has to look at
+    the whole set: claiming an unassigned duplicate while another row for the
+    same Douyin account belongs to someone else would strip their ownership.
+    """
     normalized = normalize_unique_id(unique_id)
-    removed_refs = set()
-    remaining = []
-    for account in accounts:
-        if normalize_unique_id(account.get("unique_id")) == normalized and str(account.get("account_ref", "")) != str(keep_ref):
-            ref = str(account.get("account_ref", "")).strip()
-            if ref:
-                removed_refs.add(ref)
+    for row in accounts or []:
+        if normalize_unique_id(row.get("unique_id")) != normalized:
             continue
-        remaining.append(account)
-    if len(remaining) != len(accounts):
-        accounts[:] = remaining
-    if removed_refs:
-        remove_account_refs_from_users(removed_refs)
-    return removed_refs
+        if can_access_account(current, row):
+            continue
+        if account_owner_username(row.get("account_ref", "")):
+            return True
+    return False
 
 
-def save_exported_login_result(login_result: dict, *, relogin_unique_id: str = "", relogin_account_ref: str = "", display_name: str = "") -> tuple[dict, str]:
-    unique_id = normalize_unique_id(login_result.get("unique_id"))
+def preferred_account_for_unique_id(accounts, unique_id, current):
+    """Pick the row a save should update for one stored key.
+
+    Duplicate rows for a single ``unique_id`` are legacy data. Prefer a row the
+    caller may access so a save updates the user's own row instead of an
+    unassigned duplicate that happens to sort first and would otherwise be
+    deduped into the user's row.
+    """
+    normalized = normalize_unique_id(unique_id)
+    fallback = None
+    for row in accounts or []:
+        if normalize_unique_id(row.get("unique_id")) != normalized:
+            continue
+        if can_access_account(current, row):
+            return row
+        if fallback is None:
+            fallback = row
+    return fallback
+
+
+def rows_for_identity(accounts, uid, display_id=""):
+    """Rows a login with this trusted UID may belong to.
+
+    Rows bound to the UID are the answer when they exist. Otherwise legacy
+    rows (no bound UID) whose stored key equals the UID or the ID the page
+    displayed are candidates; they still need proof or a confirmation before
+    the login is written to them.
+    """
+    bound = account_identity.accounts_bound_to(accounts, uid)
+    if bound:
+        return bound, "bound"
+    # Old saves stored the digits-only form of whatever the page showed, so a
+    # handle with letters ("abc123") lives under "123"; match both forms.
+    shown = str(display_id or "").strip()
+    keys = {str(uid or "").strip(), shown, normalize_unique_id(shown)} - {""}
+    legacy = []
+    for row in accounts or []:
+        if account_identity.account_uid(row):
+            continue
+        stored = str(row.get("unique_id") or "").strip()
+        if stored in keys or (stored and normalize_unique_id(stored) == uid and stored.isdigit()):
+            legacy.append(row)
+    return legacy, "legacy"
+
+
+def identity_owned_by_other(accounts, uid, current, display_id=""):
+    """True when a row this login maps to belongs to another Web user."""
+    rows, _kind = rows_for_identity(accounts, uid, display_id)
+    for row in rows:
+        if can_access_account(current, row):
+            continue
+        if account_owner_username(row.get("account_ref", "")):
+            return True
+    return False
+
+
+def may_claim_account(current, account):
+    """The caller's own row, or an unassigned row a proven login may adopt."""
+    if can_access_account(current, account):
+        return True
+    return not account_owner_username(account.get("account_ref", ""))
+
+
+def preferred_row(rows, current):
+    fallback = None
+    for row in rows or []:
+        if can_access_account(current, row):
+            return row
+        if fallback is None:
+            fallback = row
+    return fallback
+
+
+class IdentityConflict(RuntimeError):
+    """The login's trusted UID differs from the account it would update."""
+
+    def __init__(self, message, *, account_ref="", expected_uid="", actual_uid=""):
+        super().__init__(message)
+        self.account_ref = account_ref
+        self.expected_uid = expected_uid
+        self.actual_uid = actual_uid
+
+
+class NeedsIdentityConfirmation(RuntimeError):
+    """A legacy record cannot be checked automatically; ask the operator once."""
+
+    def __init__(self, message, *, account, fingerprint, uid, candidate_fingerprint=""):
+        super().__init__(message)
+        self.account_ref = str(account.get("account_ref", ""))
+        self.username = str(account.get("username", ""))
+        self.history_id = str(account.get("unique_id", ""))
+        self.fingerprint = fingerprint
+        self.uid = uid
+        # Digest of the whole login candidate (UID + display/nickname + every
+        # cookie with its metadata). Server-side only; never sent to the client.
+        self.candidate_fingerprint = candidate_fingerprint
+
+
+class LoginSavePermissionDenied(RuntimeError):
+    """The live session or account assignment changed before saving."""
+
+
+# Raised by the shared identity helpers too, so there is exactly one class.
+AccountChangedConcurrently = account_identity.AccountChangedConcurrently
+
+
+IDENTITY_SAVE_ERRORS = (
+    IdentityConflict,
+    NeedsIdentityConfirmation,
+    AccountChangedConcurrently,
+    account_identity.IdentityUnavailable,
+)
+IDENTITY_CONFIRMATION_TTL_SECONDS = 600
+
+
+def identity_category_label(category):
+    if category == account_identity.CATEGORY_IDENTITY_UNVERIFIED:
+        return account_identity.IDENTITY_STATE_LABELS["unverified"]
+    return CATEGORY_LABELS.get(category, CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED])
+
+
+# One-time migration confirmations live only in this process: they carry the
+# record fingerprint and the candidate UID, never cookies or tokens, and the
+# client only ever sees an opaque random key.
+_identity_confirmations: dict[str, dict] = {}
+
+
+def _issue_identity_confirmation(current, exc, route):
+    now = time.monotonic()
+    for key in [key for key, item in _identity_confirmations.items() if item["expires"] <= now]:
+        _identity_confirmations.pop(key, None)
+    token = secrets.token_urlsafe(24)
+    _identity_confirmations[token] = {
+        "username": str(current.get("username", "")),
+        "session_id": str(current.get("session_id", "")),
+        "route": route,
+        "account_ref": exc.account_ref,
+        "fingerprint": exc.fingerprint,
+        "uid": exc.uid,
+        "candidate_fingerprint": exc.candidate_fingerprint,
+        "expires": now + IDENTITY_CONFIRMATION_TTL_SECONDS,
+    }
+    return token
+
+
+def _take_identity_confirmation(token, current, route):
+    """Consume a confirmation once; returns (record, problem)."""
+    record = _identity_confirmations.pop(str(token or ""), None)
+    if not record:
+        return None, "确认已失效或已使用，请重新保存登录"
+    if record["expires"] <= time.monotonic():
+        return None, "确认已过期，请重新保存登录"
+    if (
+        record["username"] != str(current.get("username", ""))
+        or record["session_id"] != str(current.get("session_id", ""))
+        or record["route"] != route
+    ):
+        return None, "确认不属于当前会话，请重新保存登录"
+    return record, ""
+
+
+def _identity_error_response(exc, current, route, *, display_id=""):
+    if isinstance(exc, NeedsIdentityConfirmation):
+        token = _issue_identity_confirmation(current, exc, route)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "category": "identity_confirmation_required",
+                "identityState": "pending_confirmation",
+                "identityLabel": account_identity.IDENTITY_STATE_LABELS["pending_confirmation"],
+                "identity_confirmation": {
+                    "token": token,
+                    "account_ref": exc.account_ref,
+                    "username": exc.username,
+                    "history_id": exc.history_id,
+                    "history_id_type": "类型未知（可能是抖音号，也可能是平台 UID）",
+                    "platform_uid": exc.uid,
+                    "display_id": display_id,
+                    "expires_in": IDENTITY_CONFIRMATION_TTL_SECONDS,
+                },
+            },
+            status_code=409,
+        )
+    if isinstance(exc, IdentityConflict):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "category": account_identity.CATEGORY_IDENTITY_CONFLICT,
+                "identityState": "conflict",
+                "identityLabel": account_identity.IDENTITY_STATE_LABELS["conflict"],
+                "hint": account_identity.IDENTITY_STATE_HINTS["conflict"],
+                "retryable": False,
+            },
+            status_code=409,
+        )
+    if isinstance(exc, AccountChangedConcurrently):
+        return JSONResponse(
+            {"ok": False, "error": str(exc), "category": "account_changed", "retryable": True},
+            status_code=409,
+        )
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": str(exc),
+            "category": account_identity.CATEGORY_IDENTITY_UNVERIFIED,
+            "categoryLabel": account_identity.IDENTITY_STATE_LABELS["unverified"],
+            "identityState": "unverified",
+            "retryable": True,
+            # Identity checks reject before the binding write. A retryable 503
+            # here must not be mistaken for a possibly completed save.
+            "binding_pending": False,
+        },
+        status_code=503,
+    )
+
+
+def legacy_identity_check(account) -> dict:
+    """Read the UID a legacy record's own saved cookies log in as.
+
+    Runs outside the data lock (it is a network call); the fingerprint lets the
+    save refuse to use the answer if the record changed meanwhile.
+    """
+    check = {
+        "account_ref": str(account.get("account_ref", "")),
+        "fingerprint": account_identity.record_fingerprint(account),
+        "uid": "",
+        "reason": "",
+    }
+    if account_identity.account_uid(account):
+        return check
+    try:
+        check["uid"] = account_identity.fetch_trusted_identity(list(account.get("cookies") or []))["uid"]
+    except account_identity.IdentityUnavailable as exc:
+        check["reason"] = str(exc)
+    return check
+
+
+def save_exported_login_result(
+    login_result: dict,
+    *,
+    relogin_unique_id: str = "",
+    relogin_account_ref: str = "",
+    display_name: str = "",
+    is_healthy: bool | None = True,
+    verification_reason: str = "",
+    verification_category: str = "",
+    verification_token: str = "",
+    identity: dict | None = None,
+    legacy_check: dict | None = None,
+    confirmation: dict | None = None,
+    auto_matched: bool = False,
+    expected_records: dict | None = None,
+    principal_resolver=None,
+    expected_principal: dict | None = None,
+) -> tuple[dict, str]:
+    """Write a login to the account its trusted platform UID belongs to.
+
+    The match is decided before anything is written: the same bound UID
+    updates the row in place (keeping its key, targets, history, owner and
+    profile); a different bound UID is refused; a legacy row is bound only on
+    proof from its own saved cookies or a confirmed one-time migration. Any
+    refusal raises before the data file is written.
+    """
+    identity = dict(identity or login_result.get("identity") or {})
+    uid = str(identity.get("uid") or "")
+    if not account_identity.is_valid_uid(uid):
+        raise account_identity.IdentityUnavailable("暂时无法核实账号身份，未保存本次登录，请稍后重试")
     username = str(display_name or login_result.get("username") or "").strip()
     cookies = list(login_result.get("cookies") or [])
-    if not unique_id or not username or not cookies:
+    display_id = account_identity.display_id_from_text(
+        login_result.get("display_id") or ""
+    )
+    if not cookies:
         raise RuntimeError("Exported login result is incomplete")
+    if not username:
+        username = display_id or uid
+    # The whole candidate this save belongs to: the UID plus every parameter
+    # that would change what gets written (nickname, displayed ID and the full
+    # cookie list). A one-time confirmation is bound to this digest, so a
+    # different candidate cannot reuse an older confirmation. Server-side only.
+    candidate = account_identity.candidate_fingerprint(
+        uid=uid,
+        username=str(login_result.get("username") or ""),
+        display_id=display_id,
+        display_name=str(display_name or ""),
+        cookies=cookies,
+    )
+    # Every saved login gets a new generation; a background check started for an
+    # older generation must not touch this one (issue #41 A7).
+    login_generation = account_identity.new_login_generation()
 
-    accounts, _ = ensure_account_refs(get_userData(force_reload=True))
+    def verify_snapshot(target, accounts):
+        """Refuse when the chosen record changed since the pre-check snapshot.
 
-    if relogin_account_ref or relogin_unique_id:
-        target = account_by_ref(accounts, relogin_account_ref) if relogin_account_ref else find_account(accounts, relogin_unique_id)
-        if not target:
-            raise RuntimeError("Target account not found for relogin")
-        target["unique_id"] = unique_id
+        The snapshot is read before any network identity check; verifying inside
+        the data lock keeps the compare-then-write atomic (issue #41 A8).
+        """
+        authorize_save(target, accounts)
+        if expected_records is None:
+            return
+        ref = str((target or {}).get("account_ref") or "")
+        if ref not in expected_records:
+            raise AccountChangedConcurrently("目标账号在核实期间被新建或已删除，请重新保存")
+        if account_identity.record_fingerprint(target) != expected_records[ref]:
+            raise AccountChangedConcurrently("账号记录在核实期间被修改，请重新保存")
+
+    def apply_health(account):
+        """Record what is known about this login's usability on the account."""
+        if is_healthy is None:
+            # Saved before the login state was re-checked in a second browser:
+            # the background verifier decides. Until then the account is not
+            # paused, and the token lets a newer login supersede the check.
+            _clear_login_health(account)
+            account["login_verification"] = {
+                "state": "verifying",
+                "token": verification_token,
+                "generation": login_generation,
+                "startedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            return
+        account.pop("login_verification", None)
+        if is_healthy:
+            _clear_login_health(account)
+            return
+        # A verification that failed for a page or transport reason must not
+        # masquerade as a logged-out account: only a real login failure sets
+        # login_required, and the recorded category is the one the verifier found.
+        # The identity itself is proven, so old identity markers go either way.
+        account_identity.clear_identity_markers(account)
+        category = str(verification_category or CATEGORY_LOGIN_REQUIRED)
+        account["pending_login_verification"] = True
+        if category in streak_state.LOGIN_FAILURE_CATEGORIES:
+            account["login_required"] = True
+        else:
+            account.pop("login_required", None)
+        existing_health = dict(account.get("account_health") or {})
+        existing_health.update(
+            {
+                "healthy": False,
+                "category": category,
+                "reason": verification_reason or "login state could not be verified after login",
+            }
+        )
+        account["account_health"] = existing_health
+
+    def resolve_legacy(target, accounts):
+        """Return the binding method for an unbound target, or raise."""
+        others = [
+            row
+            for row in account_identity.accounts_bound_to(accounts, uid)
+            if row is not target
+        ]
+        if others:
+            raise IdentityConflict(
+                "这个平台 UID 已绑定到另一条账号记录，不能再写入这条记录",
+                account_ref=str(target.get("account_ref", "")),
+                actual_uid=uid,
+            )
+        fingerprint = account_identity.record_fingerprint(target)
+        ref = str(target.get("account_ref", ""))
+        for evidence in (legacy_check, confirmation):
+            if evidence and evidence.get("account_ref") == ref and evidence.get("fingerprint") != fingerprint:
+                raise AccountChangedConcurrently("账号记录在核实期间被修改，请重新保存")
+        if legacy_check and legacy_check.get("account_ref") == ref and legacy_check.get("uid"):
+            if legacy_check["uid"] != uid:
+                raise IdentityConflict(
+                    "本次登录的平台 UID 与这条账号原来的登录不一致，未覆盖原账号",
+                    account_ref=ref,
+                    expected_uid=legacy_check["uid"],
+                    actual_uid=uid,
+                )
+            return account_identity.BINDING_LEGACY_COOKIE, ""
+        if confirmation:
+            if confirmation.get("account_ref") != ref or confirmation.get("uid") != uid:
+                raise AccountChangedConcurrently("确认已失效：本次登录或目标账号已变化，请重新保存")
+            # The confirmation is bound to the exact candidate that was shown
+            # (UID, nickname/display and every cookie); a different candidate
+            # that happens to yield the same UID must not reuse it (issue #41 A5).
+            if str(confirmation.get("candidate_fingerprint") or "") != candidate:
+                raise AccountChangedConcurrently("本次登录的账号凭据与发起确认时不同，请重新保存")
+            return account_identity.BINDING_CONFIRMED, str(confirmation.get("confirmed_by") or "")
+        raise NeedsIdentityConfirmation(
+            "这条旧账号记录无法自动核实身份，请确认本次登录的是原账号",
+            account=target,
+            fingerprint=fingerprint,
+            uid=uid,
+            candidate_fingerprint=candidate,
+        )
+
+    def authorize_save(target, accounts):
+        # Resolve again inside the account-data lock, not from the principal
+        # captured before the network await. Check live ownership even when a
+        # caller still has an old account_refs list.
+        if principal_resolver is None:
+            return
+        live = principal_resolver()
+        previous = expected_principal or {}
+        if not live or any(
+            live.get(key) != previous.get(key)
+            for key in ("username", "role", "session_id")
+        ):
+            raise LoginSavePermissionDenied("登录会话在核实期间已变化，请重新登录")
+        if live.get("role") == "admin":
+            return
+        candidates = account_identity.accounts_bound_to(accounts, uid)
+        if target is not None:
+            candidates = candidates + [target]
+        for row in candidates:
+            owner = account_owner_username(row.get("account_ref", ""))
+            if owner and owner != live.get("username"):
+                raise LoginSavePermissionDenied("账号归属在核实期间已变化，无权保存该账号")
+
+    def update_row(target, accounts, method, confirmed_by=""):
+        authorize_save(target, accounts)
+        capture_login_before_write(target)
         target["username"] = username
         target["cookies"] = cookies
+        if display_id:
+            target[account_identity.FIELD_DISPLAY_ID] = display_id
         target.setdefault("enabled", True)
-        _dedupe_account_records(accounts, unique_id=unique_id, keep_ref=target.get("account_ref", ""))
-        save_userData(accounts)
-        return target, "updated"
+        target[account_identity.FIELD_LOGIN_GENERATION] = login_generation
+        target[account_identity.FIELD_COOKIE_IMPORT_GENERATION] = login_generation
+        if method:
+            account_identity.bind_identity(target, identity, method, confirmed_by=confirmed_by)
+        # The identity is proven (same UID, own-cookie match or confirmation),
+        # so markers from the old mixed-ID comparison no longer apply.
+        account_identity.clear_identity_markers(target)
+        apply_health(target)
+        # The save never removes, merges or re-keys any other row: only an
+        # explicit user delete or merge does that (issue #41 A3/A4).
+        return dict(target)
 
-    existing = find_account(accounts, unique_id)
-    if existing:
-        existing["username"] = username
-        existing["cookies"] = cookies
-        existing.setdefault("enabled", True)
-        _dedupe_account_records(accounts, unique_id=unique_id, keep_ref=existing.get("account_ref", ""))
-        save_userData(accounts)
-        return existing, "updated"
+    def create_row(accounts):
+        account_identity.check_expected_records(accounts, expected_records)
+        authorize_save(None, accounts)
+        for row in accounts:
+            # A new record may not reuse a stored key or a platform UID that
+            # another record already occupies, even one bound to a different
+            # UID: that would be a cross-identity key collision (issue #41 A4).
+            if str(row.get("unique_id") or "").strip() == uid:
+                raise IdentityConflict(
+                    "已有一条以该 ID 保存的旧记录，请从那条账号重新登录以完成核实",
+                    actual_uid=uid,
+                )
+            if account_identity.account_uid(row) == uid:
+                raise IdentityConflict(
+                    "这个平台 UID 已绑定到另一条账号记录，请先在账号管理里处理",
+                    actual_uid=uid,
+                )
+        account = {
+            "account_ref": f"acc-{uuid.uuid4().hex}",
+            "unique_id": uid,
+            "username": username,
+            "cookies": cookies,
+            "targets": [],
+            "enabled": True,
+        }
+        if display_id:
+            account[account_identity.FIELD_DISPLAY_ID] = display_id
+        account_identity.bind_identity(account, identity, account_identity.BINDING_NEW)
+        account[account_identity.FIELD_LOGIN_GENERATION] = login_generation
+        account[account_identity.FIELD_COOKIE_IMPORT_GENERATION] = login_generation
+        apply_health(account)
+        capture_login_before_write(None)
+        accounts.append(account)
+        return dict(account)
 
-    account = upsert_user_account(unique_id, username, cookies, [])
-    accounts, _ = ensure_account_refs(get_userData(force_reload=True))
-    _dedupe_account_records(accounts, unique_id=unique_id, keep_ref=account.get("account_ref", ""))
-    save_userData(accounts)
-    return account, "created"
+    def mutate(accounts):
+        for item in accounts:
+            if not str(item.get("account_ref", "")).strip():
+                item["account_ref"] = f"acc-{uuid.uuid4().hex}"
+
+        if relogin_account_ref or relogin_unique_id:
+            target = (
+                account_by_ref(accounts, relogin_account_ref)
+                if relogin_account_ref
+                else find_account(accounts, relogin_unique_id)
+            )
+            if not target:
+                if expected_records is not None:
+                    raise AccountChangedConcurrently("目标账号在核实期间被删除，请重新保存")
+                raise RuntimeError("Target account not found for relogin")
+            # The operator-chosen record must be the one the pre-check saw.
+            verify_snapshot(target, accounts)
+            bound_uid = account_identity.account_uid(target)
+            if bound_uid:
+                if bound_uid != uid:
+                    raise IdentityConflict(
+                        "本次登录的是另一个抖音账号（平台 UID 不同），未覆盖原账号",
+                        account_ref=str(target.get("account_ref", "")),
+                        expected_uid=bound_uid,
+                        actual_uid=uid,
+                    )
+                return update_row(target, accounts, ""), "updated", True
+            try:
+                method, confirmed_by = resolve_legacy(target, accounts)
+            except IdentityConflict:
+                if not auto_matched or not legacy_check or not legacy_check.get("uid"):
+                    raise
+                # The row was only guessed from a matching ID, and its own
+                # cookies prove it is someone else: this is a new account.
+                return create_row(accounts), "created", True
+            return update_row(target, accounts, method, confirmed_by), "updated", True
+
+        bound = account_identity.accounts_bound_to(accounts, uid)
+        if len(bound) > 1:
+            raise IdentityConflict("有多条账号记录绑定了同一个平台 UID，请先在账号管理里处理", actual_uid=uid)
+        if bound:
+            # An auto-matched record is subject to the same snapshot constraint.
+            verify_snapshot(bound[0], accounts)
+            return update_row(bound[0], accounts, ""), "updated", True
+        return create_row(accounts), "created", True
+
+    account, action, _ = update_user_data(mutate, force_reload=True)
+    return account, action
+
+
+COOKIE_LOGIN_VERIFICATION_TIMEOUT_SECONDS = 180
+
+
+async def verify_login_result(login_result, *, relogin_account_ref="", relogin_unique_id=""):
+    """Verify a pasted login result: usable login state, then trusted identity.
+
+    Returns ``(verified, reason, identity, category)`` and never raises for a
+    plain login-state failure. ``identity`` carries the trusted UID under
+    ``identity["trusted"]``; the page-read ID is kept only as ``display_id``.
+    """
+    cookies = list(login_result.get("cookies") or [])
+    identity = {
+        "unique_id": "",
+        "display_id": "",
+        "username": str(login_result.get("username") or "").strip(),
+        "trusted": {},
+    }
+    try:
+        require_auth_cookies(cookies)
+    except CookieParseError as exc:
+        return False, str(exc), identity, getattr(exc, "category", "cookie_format_invalid")
+
+    account = {
+        "cookies": cookies,
+        "unique_id": "",
+        "username": identity["username"],
+        "account_ref": relogin_account_ref,
+        "_fresh_login_verification": True,
+    }
+
+    async def verify_candidate():
+        result = await verify_account_session(account, auth_only=True)
+        resolved = dict(result.get("identity") or {})
+        identity["display_id"] = account_identity.display_id_from_text(
+            resolved.get("display_id") or resolved.get("unique_id") or ""
+        )
+        identity["username"] = str(resolved.get("username") or identity["username"]).strip()
+        trusted = await asyncio.to_thread(account_identity.fetch_trusted_identity, cookies)
+        identity["trusted"] = trusted
+        identity["unique_id"] = trusted["uid"]
+        return True, "", identity, ""
+
+    try:
+        return await asyncio.wait_for(verify_candidate(), timeout=COOKIE_LOGIN_VERIFICATION_TIMEOUT_SECONDS)
+    except FriendRefreshError as exc:
+        return False, str(exc), identity, exc.category or CATEGORY_STRUCTURE_CHANGED
+    except account_identity.IdentityUnavailable as exc:
+        # The login works but who it belongs to is unknown: retry later, do not
+        # create or overwrite an account and do not call it a logout.
+        return False, str(exc), identity, account_identity.CATEGORY_IDENTITY_UNVERIFIED
+    except (asyncio.TimeoutError, TimeoutError):
+        return False, "验证登录态超时，未保存本次登录，请稍后重试", identity, CATEGORY_NETWORK_UNAVAILABLE
+    except OSError:
+        return False, "验证时无法连接抖音，未保存本次登录，请稍后重试", identity, CATEGORY_NETWORK_UNAVAILABLE
+    except Exception as exc:  # noqa: BLE001 - an unreadable page is not a logout
+        logger.warning("Login verification failed unexpectedly: %s", type(exc).__name__)
+        return False, "暂时无法完成登录验证，未保存本次登录，请稍后重试", identity, "verification_error"
 
 
 def public_app_settings():
@@ -401,6 +1212,89 @@ def public_app_settings():
     return {key: settings.get(key) for key in allowed_keys}
 
 
+def apply_runtime_config_form(config, form):
+    if "messageTemplate" in form:
+        config["messageTemplate"] = str(
+            form.get("messageTemplate", config.get("messageTemplate", ""))
+        )
+    if "multiTask" in form:
+        config["multiTask"] = str(form.get("multiTask", "")) == "on"
+    if "taskCount" in form:
+        config["taskCount"] = coerce_int(
+            form.get("taskCount", config.get("taskCount", 1)),
+            config.get("taskCount", 1),
+            1,
+        )
+    if "hitokotoTypes" in form:
+        raw_types = str(form.get("hitokotoTypes", ""))
+        config["hitokotoTypes"] = [
+            item.strip()
+            for item in raw_types.replace(",", "\n").splitlines()
+            if item.strip()
+        ]
+
+    send_strategy = config.get("sendStrategy", {}) or {}
+    if "shuffleTargets" in form:
+        send_strategy["shuffleTargets"] = str(form.get("shuffleTargets", "")) == "on"
+    if "accountStartDelaySecondsMin" in form:
+        send_strategy["accountStartDelaySecondsMin"] = coerce_int(
+            form.get(
+                "accountStartDelaySecondsMin",
+                send_strategy.get("accountStartDelaySecondsMin", 0),
+            ),
+            send_strategy.get("accountStartDelaySecondsMin", 0),
+            0,
+        )
+    if "accountStartDelaySecondsMax" in form:
+        send_strategy["accountStartDelaySecondsMax"] = coerce_int(
+            form.get(
+                "accountStartDelaySecondsMax",
+                send_strategy.get("accountStartDelaySecondsMax", 0),
+            ),
+            send_strategy.get("accountStartDelaySecondsMax", 0),
+            send_strategy.get("accountStartDelaySecondsMin", 0),
+        )
+    if "messageIntervalSecondsMin" in form:
+        send_strategy["messageIntervalSecondsMin"] = coerce_int(
+            form.get(
+                "messageIntervalSecondsMin",
+                send_strategy.get("messageIntervalSecondsMin", 0),
+            ),
+            send_strategy.get("messageIntervalSecondsMin", 0),
+            0,
+        )
+    if "messageIntervalSecondsMax" in form:
+        send_strategy["messageIntervalSecondsMax"] = coerce_int(
+            form.get(
+                "messageIntervalSecondsMax",
+                send_strategy.get("messageIntervalSecondsMax", 0),
+            ),
+            send_strategy.get("messageIntervalSecondsMax", 0),
+            send_strategy.get("messageIntervalSecondsMin", 0),
+        )
+    if "messageVariants" in form:
+        raw_variants = str(form.get("messageVariants", ""))
+        send_strategy["messageVariants"] = [
+            item.strip()
+            for item in raw_variants.replace("\r", "\n").split("\n")
+            if item.strip()
+        ]
+    config["sendStrategy"] = send_strategy
+
+    happy_new_year = config.get("happyNewYear", {})
+    if "happyNewYearEnabled" in form:
+        happy_new_year["enabled"] = str(form.get("happyNewYearEnabled", "")) == "on"
+    if "happyNewYearTemplate" in form:
+        happy_new_year["messageTemplate"] = str(
+            form.get(
+                "happyNewYearTemplate",
+                happy_new_year.get("messageTemplate", ""),
+            )
+        )
+    config["happyNewYear"] = happy_new_year
+    return config
+
+
 def create_app():
     settings = get_app_settings()
 
@@ -413,10 +1307,17 @@ def create_app():
             logger.warning("Failed to synchronize the configured daily schedule: %s", result.stderr)
         watchdog = asyncio.create_task(login_workspace_watchdog())
         try:
+            _requeue_pending_login_verifications()
+        except Exception:
+            logger.warning("Could not requeue pending login verifications", exc_info=True)
+        try:
             yield
         finally:
             watchdog.cancel()
-            await asyncio.gather(watchdog, return_exceptions=True)
+            pending = [watchdog, *login_verification_tasks, *[operation.task for operation in binding_operations.operations.values() if operation.task and not operation.task.done()]]
+            for task in pending[1:]:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
     secure_cookie = str(os.getenv("SPARKFLOW_SESSION_COOKIE_SECURE") or "").strip().lower() in {
         "1",
         "true",
@@ -424,6 +1325,29 @@ def create_app():
         "on",
     }
     app = FastAPI(title="DouYin Spark Flow Admin", lifespan=lifespan)
+    app.state.credential_gate = asyncio.Semaphore(4)
+    app.state.credential_timeout = 3
+    shared = str(os.getenv("SPARKFLOW_SHARED_MODE", "")).lower() in {"1", "true", "yes", "on"}
+    allowed_hosts = [host.strip() for host in os.getenv("SPARKFLOW_ALLOWED_HOSTS", "").split(",") if host.strip()]
+    bootstrap_token = os.getenv("SPARKFLOW_BOOTSTRAP_TOKEN", "")
+    if shared:
+        from utils import config as config_storage
+        from webui import users as user_storage, passkeys as passkey_storage, sessions as session_storage
+        require_encrypted_files([
+            config_storage.app_settings_path(), config_storage.config_path(), config_storage.users_data_path(),
+            user_storage.USERS_FILE, passkey_storage.PASSKEYS_FILE, session_storage.store_path(),
+        ])
+        if not allowed_hosts or any("*" in host for host in allowed_hosts):
+            raise ValueError("Shared mode requires explicit SPARKFLOW_ALLOWED_HOSTS (without wildcards).")
+        if not settings.get("admin_password_hash") and len(bootstrap_token) < 24:
+            raise ValueError("Set SPARKFLOW_BOOTSTRAP_TOKEN to at least 24 characters before shared setup.")
+    # Per app instance so each test client starts clean; production runs one.
+    login_throttle = LoginThrottle()
+    app.state.login_throttle = login_throttle
+    rp_id = os.getenv("SPARKFLOW_PASSKEY_RP_ID", "").strip()
+    origin = os.getenv("SPARKFLOW_PASSKEY_ORIGIN", "").strip()
+    passkeys = PasskeyStore(rp_id, origin) if rp_id or origin else None
+    register_passkey_routes(app, passkeys, login_throttle)
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings["session_secret"],
@@ -431,7 +1355,10 @@ def create_app():
         same_site="lax",
         https_only=secure_cookie,
     )
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    if allowed_hosts:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts, www_redirect=False)
+    app.add_middleware(SecurityMiddleware, shared=shared, public_scheme="https" if secure_cookie else None)
+    app.mount("/static", public_assets(STATIC_DIR, asset_versions), name="static")
     DEBUG_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
     @app.exception_handler(Exception)
@@ -443,19 +1370,41 @@ def create_app():
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.exception_handler(StorageLockTimeout)
+    @app.exception_handler(StorageError)
+    async def storage_error_handler(request: Request, exc: StorageError):
+        logger.error("Secure storage unavailable on %s: %s", request.url.path, type(exc).__name__)
+        return PlainTextResponse("暂时无法读取或保存安全数据，请稍后重试或联系管理员。", status_code=503, headers={"Cache-Control": "no-store"})
+
+    @app.exception_handler(CredentialBusyError)
+    async def credentials_busy_handler(request: Request, exc: CredentialBusyError):
+        return PlainTextResponse("当前登录或注册请求较多，请稍后重试。", status_code=503, headers={"Cache-Control": "no-store", "Retry-After": "3"})
+
     def render_template(request, template_name, context=None, status_code=200):
+        # Older builds marked every help-page visit as an unfinished guide.
+        # A real active run now has a token; retire stale pre-upgrade markers
+        # on the user's next page load instead of keeping banners forever.
+        if request.session.get("setup_in_progress") and not request.session.get("setup_run_token"):
+            request.session.pop("setup_in_progress", None)
         base_context = dict(context or {})
+        current = current_principal(request)
+        administrator = bool(current and current.get("role") == "admin")
+        workspace_page = template_name == "login_workspace.html"
         base_context.update(
             {
                 "request": request,
-                "current_user": current_user(request),
-                "csrf_token": csrf_token(request) if current_user(request) else "",
+                "current_user": current.get("username") if current else None,
+                "csrf_token": csrf_token(request) if current else "",
                 "is_https": is_https_request(request),
-                "principal": current_principal(request),
-                "is_admin": bool(current_principal(request) and current_principal(request).get("role") == "admin"),
-                "app_settings": public_app_settings(),
-                "login_desktop_public_url": login_desktop_public_url(request),
-                "login_desktop_display_mode": login_desktop_display_mode(),
+                "principal": current,
+                "is_admin": administrator,
+                "host_operations_enabled": False,
+                "passkeys_enabled": passkeys is not None,
+                "setup_in_progress": request.session.get("setup_in_progress", False),
+                "registration_available": registration.policy()["mode"] != "closed",
+                "app_settings": public_app_settings() if template_name == "settings.html" and administrator else {},
+                "login_desktop_public_url": login_desktop_public_url(request) if workspace_page and administrator else "",
+                "login_desktop_display_mode": login_desktop_display_mode() if workspace_page and administrator else "novnc",
             }
         )
         return templates.TemplateResponse(
@@ -467,19 +1416,64 @@ def create_app():
         )
 
     def redirect(path="/", status_code=303):
+        # Some mobile clients encode a Location fragment into the request path.
+        # Keep in-page positioning in a query parameter instead of a fragment.
+        parts = urlsplit(str(path))
+        if parts.fragment and not parts.scheme and not parts.netloc and parts.path.startswith("/"):
+            query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "_anchor"]
+            query.append(("_anchor", parts.fragment))
+            path = urlunsplit(("", "", parts.path, urlencode(query), ""))
         return RedirectResponse(url=path, status_code=status_code)
 
+    @app.get("/login#account-{unique_id}", include_in_schema=False)
+    async def legacy_login_account_fragment(request: Request, unique_id: str):
+        """Translate only the mobile client's encoded numeric login anchor."""
+        if request.query_params or not (
+            unique_id.isascii() and unique_id.isdigit() and len(unique_id) <= 32
+        ):
+            return Response(status_code=404)
+        return redirect(f"/ops/send-console?_anchor=account-{unique_id}")
+
+    @app.get("/settings#notify", include_in_schema=False)
+    async def legacy_notify_fragment(request: Request):
+        if not principal(request):
+            return redirect("/login")
+        return redirect("/settings?_anchor=notify")
+
+    @app.get("/ops/send-console#account-{unique_id}", include_in_schema=False)
+    async def legacy_send_console_fragment(request: Request, unique_id: str):
+        # Some phone browsers send the dashboard's account link with "#" encoded.
+        if not (unique_id.isascii() and unique_id.isdigit() and len(unique_id) <= 32):
+            return Response(status_code=404)
+        if not principal(request):
+            return redirect("/login")
+        return redirect(f"/ops/send-console?_anchor=account-{unique_id}")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return Response(
+            content=(
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+                '<path fill="#f97316" d="M18 2 6 18h8l-2 12 14-18h-9z"/></svg>'
+            ),
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/accounts#account-{unique_id}", include_in_schema=False)
+    async def legacy_account_fragment(request: Request, unique_id: str):
+        if not (unique_id.isascii() and unique_id.isdigit() and len(unique_id) <= 32):
+            return Response(status_code=404)
+        if not principal(request):
+            return redirect("/login")
+        return redirect(f"/accounts?_anchor=account-{unique_id}")
+
     def principal(request):
-        resolved = current_principal(request)
-        if resolved:
-            return resolved
-        # Keep compatibility with older tests/signed sessions that only expose
-        # the legacy ``user`` value.
-        legacy_user = current_user(request)
-        admin_username = str(get_app_settings().get("admin_username", "admin")).strip() or "admin"
-        if legacy_user and str(legacy_user).casefold() == admin_username.casefold():
-            return {"username": admin_username, "role": "admin", "account_refs": [], "session_id": "", "enabled": True}
-        return None
+        return current_principal(request)
+
+    def controlled_login_desktop_url(request):
+        current = principal(request)
+        return login_desktop_public_url(request) if current and current["role"] == "admin" else ""
 
     def require_user(request):
         if not principal(request):
@@ -494,24 +1488,122 @@ def create_app():
             return PlainTextResponse("Forbidden", status_code=403)
         return None
 
-    def account_for_request(request, unique_id):
+    async def confirm_password(request, username, password):
+        from webui.users import authenticate
+        client_ip = request.client.host if request.client else ""
+        if login_throttle.retry_after(client_ip, username):
+            return False
+        async with credential_slot(app):
+            identity = await run_credential_work(authenticate, username, password)
+        if not identity or not await run_auth_read(refreshed_identity, identity):
+            login_throttle.record_failure(client_ip, username)
+            return False
+        login_throttle.record_success(client_ip, username)
+        return True
+
+    def admin_credential_change(request, function, *args, **kwargs):
+        live = principal(request)
+        if not live or live.get("role") != "admin":
+            raise UserStoreError("登录状态已变化，请重新登录。")
+        return function(*args, **kwargs)
+
+    def _account_request_selection(accounts, current, unique_id, account_ref):
+        """Resolve an account action to one durable record, never UID order."""
+        selected_ref = str(account_ref or "").strip()
+        if selected_ref:
+            account = account_by_ref(accounts, selected_ref)
+            if not account:
+                return None, 404
+            if normalize_unique_id(account.get("unique_id")) != normalize_unique_id(unique_id):
+                return None, 409
+            if not can_access_account(current, account):
+                return None, 403
+            return account, None
+        # Legacy callers did not send a record reference. They remain supported
+        # only if the caller can see exactly one record for that historical UID;
+        # picking the first duplicate would operate on somebody else's row.
+        visible = [
+            row for row in accounts
+            if normalize_unique_id(row.get("unique_id")) == normalize_unique_id(unique_id)
+            and can_access_account(current, row)
+        ]
+        if len(visible) == 1:
+            return visible[0], None
+        if visible:
+            return None, 409
+        exists = any(normalize_unique_id(row.get("unique_id")) == normalize_unique_id(unique_id) for row in accounts)
+        return None, 403 if exists else 404
+
+    def account_for_request(
+        request,
+        unique_id,
+        *,
+        account_ref=None,
+        login_generation=None,
+        require_generation_for_explicit_ref=False,
+        generation_present=None,
+    ):
         accounts, _ = ensure_account_refs(get_userData(force_reload=True))
-        account = account_by_unique_id(accounts, unique_id)
-        if not account:
-            return accounts, None, PlainTextResponse("Account not found", status_code=404)
-        if not can_access_account(principal(request), account):
-            return accounts, None, PlainTextResponse("Forbidden", status_code=403)
+        selected_ref = request.query_params.get("ref", "") if account_ref is None else account_ref
+        expected_generation = request.query_params.get("generation", "") if login_generation is None else login_generation
+        if generation_present is None:
+            generation_present = "generation" in request.query_params if login_generation is None else login_generation is not None
+        account, error = _account_request_selection(accounts, principal(request), unique_id, selected_ref)
+        if error:
+            return accounts, None, PlainTextResponse(
+                "Ambiguous account reference" if error == 409 else "Forbidden" if error == 403 else "Account not found",
+                status_code=error,
+            )
+        if selected_ref and require_generation_for_explicit_ref:
+            if not generation_present or account_identity.account_login_generation(account) != str(expected_generation):
+                return accounts, None, PlainTextResponse("Account login changed", status_code=409)
+        elif expected_generation and account_identity.account_login_generation(account) != str(expected_generation):
+            return accounts, None, PlainTextResponse("Account login changed", status_code=409)
         return accounts, account, None
+
+    def mutate_account_for_request(request, unique_id, mutator, *, account_ref=None, login_generation=None, generation_present=False):
+        current = principal(request)
+        selected_ref = account_ref
+
+        def mutate(accounts):
+            account, error = _account_request_selection(accounts, current, unique_id, selected_ref)
+            if error:
+                return (None, None, error), False
+            if selected_ref and (not generation_present or account_identity.account_login_generation(account) != str(login_generation)):
+                return (None, None, 409), False
+            return (account, mutator(account, accounts), None), True
+
+        account, result, error = update_user_data(mutate, force_reload=True)
+        return account, result, error
 
     def principal_account_refs(request):
         current = principal(request)
-        if not current or current.get("role") == "admin":
+        if not current:
+            return set()
+        if current.get("role") == "admin":
             return None
         return list(current.get("account_refs", []))
 
+    async def require_personal_messages(request):
+        current = principal(request)
+        if current.get("role") == "admin":
+            return None
+        from core.personal_streak import preferences, has_global_message_templates
+        profile = await asyncio.to_thread(preferences, current)
+        if not profile.get("messages") and not profile.get("revision"):
+            flash(request, "先保存自己的发送设置，再启动发送；内容可留空使用全局默认消息。", "warning")
+            return redirect("/preferences/streak")
+        if not profile.get("messages") and not has_global_message_templates(get_config()):
+            flash(request, "全局默认消息为空，请先在“设置 → 消息”配置模板，或填写个人发送内容。", "warning")
+            return redirect("/preferences/streak")
+        return None
+
     def scoped_ops_snapshot(request):
         refs = principal_account_refs(request)
-        snapshot = get_ops_snapshot(account_refs=refs)
+        snapshot = get_ops_snapshot(account_refs=refs, include_host_data=False)
+        schedule = personal_schedule_for(principal(request))
+        if schedule:
+            snapshot["schedule"] = schedule
         if refs is not None:
             # Do not place host/container state or global log tails into a
             # normal user's rendered context.
@@ -525,7 +1617,11 @@ def create_app():
         return snapshot
 
     def scoped_overview_snapshot(request):
-        return get_overview_snapshot(account_refs=principal_account_refs(request))
+        snapshot = get_overview_snapshot(account_refs=principal_account_refs(request))
+        schedule = personal_schedule_for(principal(request))
+        if schedule:
+            snapshot["schedule"] = schedule
+        return snapshot
 
     def flash(request, message, level="info"):
         request.session["flash"] = {"message": message, "level": level}
@@ -546,77 +1642,137 @@ def create_app():
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_page(request: Request):
-        if current_user(request):
-            return redirect("/")
-        return render_template(
-            request,
-            "login.html",
-            {
-                "flash": pop_flash(request),
-                "bootstrapped": is_bootstrapped(),
-            },
-        )
+        def page():
+            if principal(request):
+                return redirect("/")
+            if current_user(request):
+                clear_session(request, revoke=False)
+            return render_template(request, "login.html", {
+                "flash": pop_flash(request), "bootstrapped": is_bootstrapped(),
+                "bootstrap_token_required": bool(bootstrap_token), "login_csrf": csrf_token(request),
+            })
+        return await run_auth_read(page)
 
     @app.post("/bootstrap")
     async def bootstrap(request: Request):
-        if is_bootstrapped():
-            flash(request, "Admin login is already configured.", "warning")
+        if await run_auth_read(is_bootstrapped):
+            flash(request, "管理员账号已经设置，请直接登录。", "warning")
             return redirect("/login")
 
+        if shared and not bootstrap_token:
+            return PlainTextResponse("Shared setup requires the server initialization token.", status_code=403)
+
         form = await request.form()
+        if bootstrap_token and not secrets.compare_digest(str(form.get("bootstrap_token", "")).encode("utf-8"), bootstrap_token.encode("utf-8")):
+            return PlainTextResponse("Invalid setup token", status_code=403)
         username = str(form.get("username", "admin")).strip() or "admin"
+        from webui.users import USERNAME_RE
+        if not USERNAME_RE.fullmatch(username):
+            flash(request, "用户名只能包含字母、数字、下划线、点和短横线，最多 64 位。", "error")
+            return redirect("/login")
         password = str(form.get("password", ""))
         confirm = str(form.get("confirm_password", ""))
         if not password or password != confirm:
-            flash(request, "Password setup failed. Please enter matching passwords.", "error")
+            flash(request, "两次输入的密码不一致，请重新填写。", "error")
+            return redirect("/login")
+        problem = password_problem(password, username)
+        if problem:
+            flash(request, problem, "error")
             return redirect("/login")
 
-        bootstrap_admin_password(password, username=username)
-        flash(request, "Admin credentials created. Please log in.", "success")
+        try:
+            async with credential_slot(app):
+                await run_credential_work(bootstrap_admin_password, password, username=username)
+        except BootstrapAlreadyConfigured:
+            return PlainTextResponse("Admin login is already configured.", status_code=409)
+        flash(request, "管理员账号已创建，请登录。", "success")
         return redirect("/login")
 
     @app.post("/login")
     async def login_action(request: Request):
-        if not is_bootstrapped():
-            flash(request, "Create the admin password first.", "warning")
+        if not await run_auth_read(is_bootstrapped):
+            flash(request, "请先完成管理员初始化。", "warning")
             return redirect("/login")
 
         form = await request.form()
         username = str(form.get("username", "")).strip()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return await run_auth_read(render_template, request, "login.html", {
+                "bootstrapped": True, "login_csrf": csrf_token(request), "login_username": username[:64],
+                "flash": {"message": "登录页面已更新，请重新输入密码。", "level": "error"},
+            }, status_code=403)
         password = str(form.get("password", ""))
         from webui.users import authenticate
 
-        identity = authenticate(username, password)
-        if not identity:
-            flash(request, "Invalid username or password.", "error")
+        client_ip = request.client.host if request.client else ""
+        wait = login_throttle.retry_after(client_ip, username)
+        if wait:
+            minutes = max(1, (wait + 59) // 60)
+            logger.warning("Web login locked for ip=%s user=%r retry_after=%ss", client_ip, username[:40], wait)
+            interval = f"{wait} 秒" if wait < 60 else f"{minutes} 分钟"
+            flash(request, f"尝试次数过多，请 {interval}后再试。", "error")
             return redirect("/login")
+        async with credential_slot(app):
+            identity = await run_credential_work(authenticate, username, password)
+        identity = await run_auth_read(refreshed_identity, identity) if identity else None
+        if not identity:
+            login_throttle.record_failure(client_ip, username)
+            logger.warning("Web login failed for ip=%s user=%r", client_ip, username[:40])
+            flash(request, "用户名或密码不正确，或账号尚未启用。", "error")
+            return redirect("/login")
+        login_throttle.record_success(client_ip, username)
 
         issue_session(
             request,
             identity["username"],
             role=identity["role"],
             account_refs=identity.get("account_refs", []),
+            auth_version=identity.get("auth_version", 0),
         )
-        flash(request, "Signed in successfully.", "success")
+        flash(request, "登录成功。", "success")
         return redirect("/")
 
     @app.post("/logout")
     async def logout_action(request: Request):
-        clear_session(request)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+        await run_credential_work(clear_session, request)
         return redirect("/login")
 
     @app.get("/api/ops/overview")
     async def ops_overview(request: Request):
-        if not current_user(request):
+        if not principal(request):
             return JSONResponse(
                 {"error": "Unauthorized"},
                 status_code=401,
                 headers={"Cache-Control": "no-store"},
             )
         return JSONResponse(
-            scoped_overview_snapshot(request),
+            await asyncio.to_thread(scoped_overview_snapshot, request),
             headers={"Cache-Control": "no-store"},
         )
+
+    host_status_gate = asyncio.Lock()
+
+    @app.get("/api/ops/host-status")
+    async def host_status(request: Request):
+        current = principal(request)
+        if not current:
+            return JSONResponse({"ok": False, "error": "请先登录。"}, status_code=401)
+        if current.get("role") != "admin":
+            return JSONResponse({"ok": False, "error": "无权查看服务器状态。"}, status_code=403)
+        if host_status_gate.locked():
+            return JSONResponse({"ok": False, "error": "服务器状态正在查询，请稍后重试。"}, status_code=429, headers={"Retry-After": "2"})
+        async with host_status_gate:
+            try:
+                result = await asyncio.to_thread(get_host_status_snapshot)
+            except HostStatusBusy:
+                return JSONResponse({"ok": False, "error": "服务器状态正在查询，请稍后重试。"}, status_code=429, headers={"Retry-After": "2"})
+        live = principal(request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return JSONResponse({"ok": False, "error": "登录状态已变化，请重新登录。"}, status_code=401)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @app.post("/account/password")
     async def change_own_password(request: Request):
@@ -629,20 +1785,35 @@ def create_app():
         current = principal(request)
         if current.get("role") == "admin":
             flash(request, "请在系统设置中修改管理员密码。", "info")
-            return redirect("/")
+            return redirect("/settings#system")
+        if not await confirm_password(request, current["username"], str(form.get("current_password", ""))):
+            flash(request, "当前密码不正确或尝试次数过多，请稍后重试。", "error")
+            return redirect("/settings#password")
         password = str(form.get("new_password", ""))
         confirm = str(form.get("confirm_password", ""))
         if not password or password != confirm:
             flash(request, "两次密码输入不一致。", "error")
-            return redirect("/")
+            return redirect("/settings#password")
+        problem = password_problem(password, current["username"])
+        if problem:
+            flash(request, problem, "error")
+            return redirect("/settings#password")
         try:
-            update_web_user(current["username"], password=password)
+            def change_password():
+                from webui.users import _web_users_lock
+                with _web_users_lock():
+                    live = principal(request)
+                    if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+                        raise UserStoreError("登录状态已变化，请重新登录。")
+                    update_web_user(current["username"], password=password)
+                clear_session(request)
+            async with credential_slot(app):
+                await run_credential_work(change_password)
             flash(request, "密码已修改，请重新登录。", "success")
-            clear_session(request)
             return redirect("/login")
         except UserStoreError as exc:
             flash(request, str(exc), "error")
-            return redirect("/")
+            return redirect("/settings#password")
 
     @app.post("/admin/users/create")
     async def create_admin_user(request: Request):
@@ -653,8 +1824,12 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         refs = [value for value in form.getlist("account_refs")] if hasattr(form, "getlist") else []
+        problem = password_problem(str(form.get("password", "")), str(form.get("username", "")))
+        if problem:
+            flash(request, problem, "error")
+            return redirect("/settings#users")
         try:
-            create_web_user(
+            await run_credential_work(admin_credential_change, request, create_web_user,
                 str(form.get("username", "")),
                 str(form.get("password", "")),
                 enabled=str(form.get("enabled", "")) == "on",
@@ -663,7 +1838,7 @@ def create_app():
             flash(request, "普通用户已创建。", "success")
         except UserStoreError as exc:
             flash(request, str(exc), "error")
-        return redirect("/#user-management")
+        return redirect("/settings#users")
 
     @app.post("/admin/users/{username}/update")
     async def update_admin_user(request: Request, username: str):
@@ -674,8 +1849,14 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         refs = [value for value in form.getlist("account_refs")] if hasattr(form, "getlist") else []
+        new_password = str(form.get("password", ""))
+        if new_password:
+            problem = password_problem(new_password, str(form.get("new_username", "")).strip() or username)
+            if problem:
+                flash(request, problem, "error")
+                return redirect("/settings#users")
         try:
-            update_web_user(
+            await run_credential_work(admin_credential_change, request, update_web_user,
                 username,
                 new_username=str(form.get("new_username", "")).strip() or None,
                 password=str(form.get("password", "")) or None,
@@ -685,7 +1866,22 @@ def create_app():
             flash(request, "普通用户已更新。", "success")
         except UserStoreError as exc:
             flash(request, str(exc), "error")
-        return redirect("/#user-management")
+        return redirect("/settings#users")
+
+    @app.post("/admin/users/{username}/revoke-sessions")
+    async def revoke_user_sessions(request: Request, username: str):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+        try:
+            await run_credential_work(admin_credential_change, request, update_web_user, username, revoke_sessions=True)
+            flash(request, "该用户的登录会话已撤销，下次操作需要重新登录。", "success")
+        except UserStoreError as exc:
+            flash(request, str(exc), "error")
+        return redirect("/settings#users")
 
     @app.post("/admin/users/{username}/delete")
     async def delete_admin_user(request: Request, username: str):
@@ -696,35 +1892,267 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
         try:
-            if delete_web_user(username):
+            if await run_credential_work(admin_credential_change, request, delete_web_user, username):
                 flash(request, "普通用户已删除，抖音账号数据未删除。", "success")
             else:
                 flash(request, "普通用户不存在。", "error")
         except UserStoreError as exc:
             flash(request, str(exc), "error")
-        return redirect("/#user-management")
+        return redirect("/settings#users")
+
+    def console_context(request, *, with_admin_data=False, with_ops=True):
+        current = principal(request)
+        is_admin_user = current.get("role") == "admin"
+        context = {
+            "flash": pop_flash(request),
+            "accounts": get_visible_accounts(current, get_userData(force_reload=True)),
+            "ops": scoped_ops_snapshot(request) if with_ops else {},
+            "principal": current,
+            "is_admin": is_admin_user,
+            "runtime_config": {},
+            "web_users": [],
+            "all_accounts": [],
+        }
+        if with_admin_data and is_admin_user:
+            context["runtime_config"] = get_config(force_reload=True)
+            context["web_users"] = get_web_users()
+            context["all_accounts"] = get_userData(force_reload=True)
+        return context
+
+    def filter_send_console(ops, query_params):
+        """Return a display-only narrowed copy of the send-detail snapshot."""
+        allowed_statuses = {"all", "confirmed", "pending", "attention"}
+        status = str(query_params.get("status", "all")).strip()
+        if status not in allowed_statuses:
+            status = "all"
+        query = str(query_params.get("q", "")).strip()[:120]
+        account = str(query_params.get("account", "")).strip()
+
+        filtered_ops = dict(ops)
+        console = dict(ops.get("send_console") or {})
+        source_accounts = list(console.get("accounts") or [])
+        account_ids = {str(item.get("unique_id") or "") for item in source_accounts}
+        if account not in account_ids:
+            account = ""
+        if account:
+            source_accounts = [item for item in source_accounts if str(item.get("unique_id") or "") == account]
+
+        status_fields = {
+            "confirmed": {"confirmed_targets"},
+            "pending": {"unconfirmed_targets"},
+            "attention": {"failed_targets", "account_blocked_targets"},
+        }
+        visible_fields = status_fields.get(status)
+        filtered_accounts = []
+        for source in source_accounts:
+            row = dict(source)
+            for field in (
+                "confirmed_targets", "page_echo_targets", "receipt_only_targets", "unconfirmed_targets",
+                "failed_targets", "account_blocked_targets", "pending_targets", "unprocessed_targets",
+            ):
+                items = list(source.get(field) or [])
+                if visible_fields is not None and field not in visible_fields:
+                    items = []
+                if query:
+                    needle = query.casefold()
+                    items = [item for item in items if needle in str(item.get("target") or "").casefold()]
+                row[field] = items
+            row["page_echo_count"] = len(row["page_echo_targets"])
+            row["receipt_only_count"] = len(row["receipt_only_targets"])
+            filtered_accounts.append(row)
+        console["accounts"] = filtered_accounts
+        filtered_ops["send_console"] = console
+        return filtered_ops, {
+            "status": status,
+            "account": account,
+            "query": query,
+            "accounts": list((ops.get("send_console") or {}).get("accounts") or []),
+        }
+
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_page(request: Request):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
+        # The guide is also the manual help page.  Only an explicit restart
+        # creates cross-page progress, so viewing help (including from an old
+        # tab) cannot resurrect a completed run.
+        if request.query_params.get("restart") == "1":
+            request.session["setup_in_progress"] = True
+            request.session["setup_run_token"] = secrets.token_urlsafe(24)
+            request.session.pop("setup_account_ref", None)
+        from core.personal_streak import preferences
+        from webui.setup_flow import setup_state, requested_step
+        current = principal(request)
+        accounts = await asyncio.to_thread(get_visible_accounts, current)
+        profile = await asyncio.to_thread(preferences, current)
+        active = bool(request.session.get("setup_in_progress"))
+        selected = str(request.query_params.get("account", request.session.get("setup_account_ref", "")))
+        state = setup_state(accounts, profile, selected)
+        account = state["setup_account"]
+        # Remember the account shown by help as well, so a removed selection is
+        # reported rather than silently falling through to another account.
+        # This is selection only; it never marks a guide run as active.
+        if account:
+            request.session["setup_account_ref"] = account["account_ref"]
+        return render_template(request, "setup.html", {
+            **state, "accounts": accounts, "flash": pop_flash(request),
+            "setup_run_token": request.session.get("setup_run_token", "") if active else "",
+            "step": requested_step(request.query_params.get("step"), state),
+        })
+
+    @app.post("/setup/finish")
+    async def finish_setup(request: Request):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+        from core.personal_streak import preferences
+        from webui.setup_flow import setup_state, setup_binding_revision
+        current = principal(request)
+        selected_ref = str(form.get("account_ref", "")).strip()
+        expected_revision = str(form.get("binding_revision", "")).strip()
+        submitted_run_token = str(form.get("setup_run_token", ""))
+        active_run_token = str(request.session.get("setup_run_token", ""))
+        if active_run_token:
+            if not submitted_run_token or not hmac.compare_digest(active_run_token, submitted_run_token):
+                flash(request, "这个引导页面已过期，请返回当前引导继续。", "warning")
+                return redirect("/setup")
+        elif submitted_run_token:
+            flash(request, "这个引导页面已过期，请重新打开引导。", "warning")
+            return redirect("/setup")
+        revision_invalid = bool(expected_revision and (len(expected_revision) != 64 or any(char not in "0123456789abcdef" for char in expected_revision)))
+        if (shared and (not selected_ref or not expected_revision)) or revision_invalid:
+            flash(request, "这个引导页面已过期，请重新打开当前步骤后再完成。", "warning")
+            return redirect("/setup")
+        state = setup_state(
+            await asyncio.to_thread(get_visible_accounts, current),
+            await asyncio.to_thread(preferences, current),
+            selected_ref or str(request.session.get("setup_account_ref", "")),
+        )
+        if expected_revision and state["setup_account"] and not hmac.compare_digest(expected_revision, setup_binding_revision(state["setup_account"])):
+            flash(request, "这个账号的登录身份已更新，请重新检查当前步骤后再完成。", "warning")
+            return redirect("/setup?account=" + quote(selected_ref, safe=""))
+        if not state["can_finish"]:
+            flash(request, state["setup_blocked_reason"], "warning")
+            return redirect("/setup?step=" + str(state["suggested_step"]))
+        if state["login_pending"]:
+            flash(request, "配置已保存，登录状态仍待确认；请在账号页查看核验结果。", "warning")
+        elif not state["automatic_enabled"]:
+            flash(request, "设置完成。自动发送已暂停，需要时可以手动发送。", "success")
+        else:
+            flash(request, "设置完成，后续发送仍会检查账号状态。", "success")
+        request.session.pop("setup_in_progress", None)
+        request.session.pop("setup_run_token", None)
+        request.session.pop("setup_account_ref", None)
+        return redirect("/")
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request):
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
+        return render_template(request, "dashboard.html", await asyncio.to_thread(console_context, request))
 
+    @app.get("/accounts", response_class=HTMLResponse)
+    async def accounts_page(request: Request):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
+        return render_template(request, "accounts.html", await asyncio.to_thread(console_context, request, with_ops=False))
+
+    @app.get("/accounts/{unique_id}/picker-cache")
+    async def account_picker_cache(request: Request, unique_id: str):
+        expected = {
+            "account_ref": request.query_params.get("ref", ""),
+            "login_generation": request.query_params.get("generation", ""),
+        }
+        if not principal(request):
+            return JSONResponse({"error": "请重新登录。"}, status_code=401)
+        if not expected["account_ref"]:
+            return JSONResponse({"error": "账号登录已更新，请重新打开账号页。"}, status_code=409)
+        _, account, error = await asyncio.to_thread(
+            account_for_request, request, unique_id, account_ref=expected["account_ref"]
+        )
+        if error:
+            return JSONResponse({"error": "无法读取这个账号。"}, status_code=error.status_code)
+        if not account_identity.same_login_snapshot(account, expected):
+            return JSONResponse({"error": "账号登录已更新，请重新打开账号页。"}, status_code=409)
+        payload = await asyncio.to_thread(picker_cache, account)
+        # A transfer, deletion or re-login during the read must not expose the
+        # old snapshot to a principal whose access has since changed.
+        if not principal(request):
+            return JSONResponse({"error": "请重新登录。"}, status_code=401)
+        accounts, current, error = await asyncio.to_thread(
+            account_for_request, request, unique_id, account_ref=expected["account_ref"]
+        )
+        if error:
+            status = 409 if error.status_code == 404 and account_by_unique_id(accounts, unique_id) else error.status_code
+            return JSONResponse({"error": "无法读取这个账号。"}, status_code=status)
+        if not account_identity.same_login_snapshot(current, expected):
+            return JSONResponse({"error": "账号登录已更新，请重新打开账号页。"}, status_code=409)
+        return JSONResponse(payload)
+
+    @app.get("/login-workspace", response_class=HTMLResponse)
+    async def login_workspace_page(request: Request):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
+        context = await asyncio.to_thread(console_context, request, with_ops=False)
+        # "Re-login" on the accounts page lands here with the account preselected;
+        # only accounts the current user can see are matched.
+        relogin_ref = str(request.query_params.get("relogin_ref", "")).strip()
+        relogin = str(request.query_params.get("relogin", "")).strip()
+        requested_generation = str(request.query_params.get("generation", ""))
+        if relogin_ref:
+            context["relogin_account"] = next(
+                (account for account in context["accounts"] if str(account.get("account_ref") or "") == relogin_ref),
+                None,
+            )
+            if context["relogin_account"] is None:
+                return PlainTextResponse("Account not found", status_code=404)
+        elif relogin:
+            legacy_matches = [
+                account for account in context["accounts"]
+                if str(account.get("unique_id") or "") == relogin
+            ]
+            if len(legacy_matches) != 1:
+                return PlainTextResponse("Ambiguous account reference" if legacy_matches else "Account not found", status_code=409 if legacy_matches else 404)
+            context["relogin_account"] = legacy_matches[0]
+        else:
+            context["relogin_account"] = None
+        if context["relogin_account"] and requested_generation and account_identity.account_login_generation(context["relogin_account"]) != requested_generation:
+            return PlainTextResponse("Account login changed", status_code=409)
+        return render_template(request, "login_workspace.html", context)
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_page(request: Request):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
         current = principal(request)
-        accounts = get_visible_accounts(current, get_userData(force_reload=True))
+        context = await asyncio.to_thread(console_context, request, with_admin_data=True)
+        live = await run_auth_read(principal, request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return redirect("/login")
+        if principal(request)["role"] == "admin":
+            context["registration"] = registration.policy()
+            context["invitations"] = registration.invitations()
+        identity = passkey_identity(principal(request)["username"]) if passkeys else None
+        context["passkey_list"] = await run_credential_work(passkeys.list_keys, identity) if identity else []
+        live = await run_auth_read(principal, request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return redirect("/login")
+        if principal(request).get("role") == "admin":
+            context["notify"] = notify.notifications_view(
+                get_config(force_reload=True).get("notifications")
+            )
         return render_template(
             request,
-            "dashboard.html",
-            {
-                "flash": pop_flash(request),
-                "accounts": accounts,
-                "runtime_config": get_config(force_reload=True) if current.get("role") == "admin" else {},
-                "ops": scoped_ops_snapshot(request),
-                "principal": current,
-                "is_admin": current.get("role") == "admin",
-                "web_users": get_web_users() if current.get("role") == "admin" else [],
-                "all_accounts": get_userData(force_reload=True) if current.get("role") == "admin" else [],
-            },
+            "settings.html",
+            context,
         )
 
     @app.get("/ops/send-console", response_class=HTMLResponse)
@@ -733,41 +2161,165 @@ def create_app():
         if maybe_redirect:
             return maybe_redirect
 
+        ops, send_filters = filter_send_console(await asyncio.to_thread(scoped_ops_snapshot, request), request.query_params)
         return render_template(
             request,
             "send_console.html",
             {
                 "flash": pop_flash(request),
-                "ops": scoped_ops_snapshot(request),
+                "ops": ops,
+                "send_filters": send_filters,
             },
         )
 
     @app.post("/accounts/{unique_id}/update")
     async def update_account(request: Request, unique_id: str):
+        ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
         maybe_redirect = require_user(request)
         if maybe_redirect:
+            if ajax:
+                return JSONResponse({"ok": False, "error": "登录已过期，请重新登录后再保存。", "redirect": "/login", "retryable": False}, status_code=401)
             return maybe_redirect
 
         form = await request.form()
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            if ajax:
+                return JSONResponse({"ok": False, "error": "页面已过期，请刷新后重试。", "retryable": False}, status_code=403)
             return Response("Invalid CSRF token", status_code=403)
 
         username = str(form.get("username", "")).strip()
-        targets = extract_targets_from_form(form)
+        submitted_revision = str(form.get("edit_revision", ""))
+        submitted_ref = str(form.get("account_ref", "")).strip()
+        submitted_generation = str(form.get("login_generation", ""))
+        expected_snapshot = {"account_ref": submitted_ref, "login_generation": submitted_generation}
 
-        accounts, account, access_error = account_for_request(request, unique_id)
-        if access_error:
-            return access_error
-        if account:
+        # Old hand-written posts did not include record identity; retain that
+        # route behavior.  Rendered picker forms always include it, making a
+        # duplicate historical unique_id unambiguous through the save roundtrip.
+        if submitted_ref:
+            _, selected, selection_error = await asyncio.to_thread(
+                account_for_request, request, unique_id, account_ref=submitted_ref
+            )
+            if selection_error:
+                status = selection_error.status_code
+                if ajax:
+                    return JSONResponse({"ok": False, "error": "无权操作此账号。" if status == 403 else "账号已移除。", "retryable": False}, status_code=status)
+                return PlainTextResponse("Forbidden" if status == 403 else "Account not found", status_code=status)
+            if not account_identity.same_login_snapshot(selected, expected_snapshot):
+                message = "账号登录已更新，请重新打开账号页后再保存。"
+                if ajax:
+                    return JSONResponse({"ok": False, "error": message, "category": "edit_conflict", "retryable": True}, status_code=409)
+                return render_template(request, "edit_conflict.html", {"edit_message": message, "submitted_name": username, "submitted_targets": str(form.get("targets", "")), "submitted_groups": form.getlist("group_bind"), "review_url": f"/accounts?_anchor=account-{quote(submitted_ref, safe='')}"}, status_code=409)
+
+        def mutate(account, accounts):
+            del accounts
+            if submitted_ref and not account_identity.same_login_snapshot(account, expected_snapshot):
+                raise AccountEditConflict(account, "账号登录已更新，请重新打开账号页后再保存。")
+            live = principal(request)
+            if not live or not can_access_account(live, account):
+                raise LoginSavePermissionDenied("账号权限已变化，请刷新页面后重试。")
+            revision = account_edit_revision(account)
+            missing_revision = not submitted_revision
+            changed_revision = submitted_revision and (not submitted_revision.isascii() or not hmac.compare_digest(submitted_revision, revision))
+            if missing_revision or changed_revision:
+                raise AccountEditConflict(account)
+            previous_targets = list(account.get("targets") or [])
+            picked_ids = sorted({str(value) for value in form.getlist('group_bind')})
+            cache = {
+                str(item.get('conversationId')): str(item.get('name') or '').strip()
+                for item in account.get('group_cache', [])
+                if isinstance(item, dict) and str(item.get('conversationId') or '').strip()
+            }
+            previous_bindings = {
+                str(target): str(conversation_id)
+                for target, conversation_id in dict(account.get('group_target_bindings') or {}).items()
+                if str(target).strip() and str(conversation_id).strip()
+            }
+            unknown_group = any(conversation_id not in cache and conversation_id not in previous_bindings.values() for conversation_id in picked_ids)
+            if submitted_revision and unknown_group:
+                raise AccountEditConflict(account, "群列表已变化，部分所选群暂时无法核实。本次尚未保存，请刷新列表后核对。")
             account["username"] = username or account.get("username", "")
-            account["targets"] = targets
+            old_target_by_id = {}
+            for target, conversation_id in previous_bindings.items():
+                old_target_by_id.setdefault(conversation_id, target)
+            bindings = {}
+            bound_targets = []
+            # Bound targets are daily-send ledger keys.  Reusing them by stable
+            # conversation id prevents a refresh/name change from making the
+            # sender treat the same group as a new target today.
+            for conversation_id in picked_ids:
+                target = old_target_by_id.get(conversation_id)
+                if target:
+                    bindings[target] = conversation_id
+                    bound_targets.append(target)
+            existing_targets = set(previous_bindings)
+            existing_visible_names = {
+                target.removeprefix('群聊：').removeprefix('群聊:')
+                for target in previous_bindings
+            }
+            cached_name_counts = {}
+            for name in cache.values():
+                if name:
+                    cached_name_counts[name] = cached_name_counts.get(name, 0) + 1
+            for conversation_id in picked_ids:
+                if conversation_id in old_target_by_id:
+                    continue
+                name = cache.get(conversation_id)
+                if not name:
+                    continue
+                collides = cached_name_counts.get(name, 0) > 1 or name in existing_visible_names
+                target = f'群聊：{name}{f"#{conversation_id[-4:]}" if collides else ""}'
+                if target in existing_targets or target in bindings:
+                    target = f'{target}#{conversation_id[-4:]}'
+                bindings[target] = conversation_id
+                bound_targets.append(target)
+            bound_target_set = set(bound_targets)
+            manual_groups = [
+                item for item in extract_group_targets_from_form(form)
+                if item not in bound_target_set
+            ]
+            account["targets"] = _dedupe_targets([*extract_targets_from_form(form), *manual_groups, *bound_targets])
+            account['group_target_bindings'] = bindings
             account["enabled"] = str(form.get("enabled", "")) == "on"
-            save_userData(accounts)
-            flash(request, f"Updated account {account['username']}.", "success")
+            # Selecting a friend as a target binds it to that friend's uid; a
+            # target that stays selected keeps its existing binding.
+            friend_identity.apply_web_target_selection(account, previous_targets)
+            return None
+
+        try:
+            account, _, access_error = await asyncio.to_thread(
+                mutate_account_for_request,
+                request,
+                unique_id,
+                mutate,
+                account_ref=submitted_ref or None,
+                login_generation=submitted_generation,
+                generation_present="login_generation" in form,
+            )
+        except AccountEditConflict as exc:
+            if not ajax:
+                submitted_targets = _dedupe_targets([*extract_targets_from_form(form), *extract_group_targets_from_form(form)])
+                return render_template(request, "edit_conflict.html", {"edit_message": str(exc), "submitted_name": username, "submitted_targets": "\n".join(submitted_targets), "submitted_groups": form.getlist("group_bind"), "review_url": f"/accounts?_anchor=account-{quote(str(unique_id), safe='')}"}, status_code=409)
+            return JSONResponse({"ok": False, "error": str(exc), "category": "edit_conflict", "retryable": True, "edit_revision": exc.revision}, status_code=409)
+        except LoginSavePermissionDenied as exc:
+            return JSONResponse({"ok": False, "error": str(exc), "retryable": False}, status_code=403)
+        except (StorageError, StorageLockTimeout):
+            return JSONResponse({"ok": False, "error": "暂时无法保存，请保留本次输入并稍后重试。", "retryable": True}, status_code=503)
+        if access_error:
+            if ajax:
+                return JSONResponse({"ok": False, "error": "无权操作此账号。" if access_error == 403 else "账号已移除。", "retryable": False}, status_code=access_error)
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
+        if account:
+            if ajax:
+                return JSONResponse({"ok": True, "message": "账号设置已保存。", "edit_revision": account_edit_revision(account), "account": {"account_ref": account.get("account_ref"), "unique_id": account.get("unique_id"), "username": account.get("username"), "target_count": len(account.get("targets") or []), "enabled": bool(account.get("enabled", True))}})
+            flash(request, f"已保存账号 {account['username']}，共 {len(account.get('targets') or [])} 个发送目标。", "success")
         else:
             flash(request, "Account not found.", "error")
 
-        return redirect("/")
+        return redirect(f"/accounts#account-{quote(str(unique_id), safe='')}")
 
     @app.post("/accounts/{unique_id}/toggle-enabled")
     async def toggle_account_enabled(request: Request, unique_id: str):
@@ -779,18 +2331,745 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        accounts, account, access_error = account_for_request(request, unique_id)
-        if access_error:
-            return access_error
+        submitted_ref = str(form.get("account_ref", "")).strip()
+        submitted_generation = str(form.get("login_generation", ""))
 
-        account["enabled"] = not is_account_enabled(account)
-        save_userData(accounts)
+        def mutate(account, accounts):
+            del accounts
+            account["enabled"] = not is_account_enabled(account)
+            return None
+
+        account, _, access_error = mutate_account_for_request(
+            request,
+            unique_id,
+            mutate,
+            account_ref=submitted_ref or None,
+            login_generation=submitted_generation,
+            generation_present="login_generation" in form,
+        )
+        if access_error:
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
         flash(
             request,
             f"{account.get('username', 'Account')} 已{'启用' if account['enabled'] else '停用'}自动续火花。",
             "success",
         )
-        return redirect("/")
+        return redirect(f"/accounts#account-{quote(str(unique_id), safe='')}")
+
+    # Async friend refresh. The web app is a single uvicorn process, so a plain
+    # dict is enough: one entry per durable record, overwritten only by that
+    # record's next refresh. Historical rows can share one platform UID.
+    friend_refresh_jobs: dict[str, dict] = {}
+
+    def _write_friend_cache(account_ref, friends, updated_at, snapshot):
+        def mutate(accounts):
+            target = account_by_ref(accounts, account_ref)
+            if not account_identity.same_login_snapshot(target, snapshot):
+                return False, False
+            target["friends_cache"] = list(friends)
+            target["friends_cache_updated_at"] = updated_at
+            return True, True
+
+        return update_user_data(mutate, force_reload=True)
+
+    def _record_friend_identity(account, friends):
+        """Save the uids a complete refresh read and reconcile the targets."""
+        try:
+            result = friend_identity.persist_identity_scan(
+                account,
+                getattr(friends, "uid_entries", None) or [],
+                scan_complete=True,
+                scanned_names=list(friends),
+                sync_user=False,
+            )
+        except Exception:
+            logger.warning(
+                "Friend uid update after refresh failed for %s",
+                account.get("username", "unknown"),
+                exc_info=True,
+            )
+            return {}
+        if not result:
+            return {}
+        return {
+            "uidCount": result["uidCount"],
+            "uidDataTrusted": result["uidDataTrusted"],
+            "renamed": [
+                {"oldName": item["oldName"], "newName": item["newName"]}
+                for item in result["renamed"]
+            ],
+            "missing": [
+                item["target"]
+                for item in result["targets"]
+                if item["status"] == friend_identity.STATUS_MISSING
+            ],
+        }
+
+    def _refresh_snapshot_is_current(snapshot):
+        current = account_by_ref(get_userData(force_reload=True), snapshot.get("account_ref", ""))
+        return account_identity.same_login_snapshot(current, snapshot)
+
+    def _finish_friend_job(account_ref, normalized_id, snapshot, *, job=None, remove=False, **fields):
+        """Finish only the exact refresh job that installed this marker."""
+        current_job = friend_refresh_jobs.get(account_ref)
+        if (
+            current_job is None
+            or current_job is not job
+            or not account_identity.same_login_snapshot(current_job, snapshot)
+        ):
+            return False
+        if remove:
+            friend_refresh_jobs.pop(account_ref, None)
+        else:
+            current_job.update(fields)
+            current_job["finishedAt"] = datetime.now().isoformat(timespec="seconds")
+        _friend_refresh_active.discard(normalized_id)
+        return True
+
+    async def _run_friend_refresh_job(normalized_id, account, username, *, account_ref=None, job=None):
+        account = dict(account, _refresh_snapshot=account_identity.login_snapshot(account))
+        account_ref = str(account_ref or account["_refresh_snapshot"].get("account_ref") or "")
+        if not account_ref:
+            _friend_refresh_active.discard(normalized_id)
+            return
+        if job is None:
+            job = friend_refresh_jobs.get(account_ref)
+
+        def cleanup_cancelled_job(done):
+            if done.cancelled():
+                _finish_friend_job(
+                    account_ref,
+                    normalized_id,
+                    account["_refresh_snapshot"],
+                    job=job,
+                    remove=True,
+                )
+
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            current_task.add_done_callback(cleanup_cancelled_job)
+
+        def on_progress(collected):
+            if job is not None and friend_refresh_jobs.get(account_ref) is job:
+                job["stage"] = "collecting"
+                job["collected"] = int(collected)
+
+        try:
+            friends = await asyncio.wait_for(
+                fetch_account_friends(account, on_progress=on_progress),
+                timeout=_FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            _finish_friend_job(
+                account_ref,
+                normalized_id,
+                account["_refresh_snapshot"],
+                job=job,
+                remove=True,
+            )
+            raise
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Async friend refresh timed out for %s after %ss",
+                account.get("username", normalized_id),
+                _FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
+            # Exceeding the read budget is an incomplete read, not a transport
+            # failure, so the console reports it the same way as a stalled scan.
+            _finish_friend_job(
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
+                state="failed",
+                stage="incomplete",
+                **_incomplete_scan_fields(
+                    f"读取超时，超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒"
+                ),
+                scanComplete=False,
+            )
+            return
+        except FriendRefreshError as exc:
+            category = exc.category or CATEGORY_STRUCTURE_CHANGED
+            logger.warning(
+                "Async friend refresh failed for %s category=%s: %s",
+                account.get("username", normalized_id),
+                category,
+                exc,
+            )
+            _finish_friend_job(
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
+                state="failed",
+                stage="failed",
+                error=str(exc),
+                category=category,
+                categoryLabel=CATEGORY_LABELS.get(
+                    category, CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED]
+                ),
+                retryable=category != CATEGORY_LOGIN_REQUIRED,
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "Async friend refresh errored for %s: %s",
+                account.get("username", normalized_id),
+                exc,
+                exc_info=True,
+            )
+            _finish_friend_job(
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
+                state="failed",
+                stage="failed",
+                error=str(exc),
+                category=CATEGORY_STRUCTURE_CHANGED,
+                categoryLabel=CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED],
+                retryable=True,
+            )
+            return
+
+        previous_cache = list(account.get("friends_cache") or [])
+        scan_complete = bool(getattr(friends, "complete", False))
+        scan_reason = str(getattr(friends, "reason", "") or "")
+        if not scan_complete:
+            # A read that stopped early is not proof the list shrank, so it must
+            # never replace the last good cache or rebuild the send index.
+            logger.warning(
+                "Async friend refresh incomplete for %s: count=%s reason=%s",
+                account.get("username", normalized_id),
+                len(friends),
+                scan_reason or "-",
+            )
+            _finish_friend_job(
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
+                state="failed",
+                stage="incomplete",
+                **_incomplete_scan_fields(scan_reason),
+                scanComplete=False,
+            )
+            return
+        if not friends:
+            logger.warning(
+                "Async friend refresh returned no names for %s (complete=%s); keeping %s cached friends",
+                account.get("username", normalized_id),
+                scan_complete,
+                len(previous_cache),
+            )
+            _finish_friend_job(
+                account_ref, normalized_id, account["_refresh_snapshot"],
+                job=job,
+                state="failed",
+                stage="empty",
+                error="本次没有读到任何好友，已保留上一次的好友数据；请稍后重试，或先确认该账号登录态。",
+                category=CATEGORY_EMPTY_RESULT,
+                categoryLabel=CATEGORY_LABELS[CATEGORY_EMPTY_RESULT],
+                retryable=True,
+            )
+            return
+
+        updated_at = datetime.now().isoformat(timespec="seconds")
+        if not await asyncio.to_thread(_write_friend_cache, account_ref, friends, updated_at, account["_refresh_snapshot"]):
+            _finish_friend_job(account_ref, normalized_id, account["_refresh_snapshot"], job=job, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
+            return
+
+        index_updated = False
+        if scan_complete and friends:
+            try:
+                recorded = await asyncio.to_thread(
+                    record_friend_scan, account,
+                    friends,
+                    scan_complete=True,
+                    targets=account.get("targets") or [],
+                )
+                index_updated = recorded is not False
+            except Exception:
+                logger.warning(
+                    "Friend index update after async refresh failed for %s",
+                    account.get("username", normalized_id),
+                    exc_info=True,
+                )
+        identity = await asyncio.to_thread(_record_friend_identity, account, friends) if index_updated else {}
+
+        if not await asyncio.to_thread(_refresh_snapshot_is_current, account["_refresh_snapshot"]):
+            _finish_friend_job(account_ref, normalized_id, account["_refresh_snapshot"], job=job, state="failed", stage="changed", error="账号已更新或移除，本次旧刷新结果未保存。", category="account_changed", retryable=True)
+            return
+
+        _finish_friend_job(
+            account_ref, normalized_id, account["_refresh_snapshot"],
+            job=job,
+            state="done",
+            stage="done",
+            friends=list(friends),
+            updatedAt=updated_at,
+            scanComplete=scan_complete,
+            indexUpdated=index_updated,
+            identity=identity,
+            message=f"已刷新 {len(friends)} 个好友"
+            + ("，并已重建发送索引" if index_updated else ""),
+        )
+
+    def _launch_friend_refresh_task(runner, normalized_id, account, username, *, account_ref, job):
+        """Install cancellation ownership before the coroutine can first run."""
+        snapshot = account_identity.login_snapshot(account)
+        task = asyncio.create_task(runner(normalized_id, account, username, account_ref=account_ref, job=job))
+        def cleanup_prestart_cancel(done):
+            if done.cancelled():
+                _finish_friend_job(account_ref, normalized_id, snapshot, job=job, remove=True)
+        task.add_done_callback(cleanup_prestart_cancel)
+        return task
+
+    def _start_friend_refresh_if_free(normalized_id, account, username):
+        """Start the background friend refresh when nothing blocks it.
+
+        Returns what the caller should report: started, running (already
+        refreshing), busy (a send run holds the lock, because the send flow
+        drives its own browser per account) or skipped.
+        """
+        if not normalized_id:
+            return "skipped"
+        if task_run_lock_status().get("running"):
+            return "busy"
+        if normalized_id in _friend_refresh_active or friend_refresh_conflict(normalized_id):
+            return "running"
+        account_ref = str(account.get("account_ref") or "")
+        if not account_ref:
+            return "skipped"
+        _friend_refresh_active.add(normalized_id)
+        job = {
+            **account_identity.login_snapshot(account),
+            "state": "running",
+            "stage": "starting",
+            "collected": 0,
+            "startedAt": datetime.now().isoformat(timespec="seconds"),
+            "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+        }
+        friend_refresh_jobs[account_ref] = job
+        _launch_friend_refresh_task(
+            _run_friend_refresh_job, normalized_id, dict(account), str(username or ""),
+            account_ref=account_ref, job=job,
+        )
+        return "started"
+
+    # A saved login is verified here, one account at a time: each check drives
+    # a browser, and the two-core host shares it with the login browser and the
+    # send runs. The check waits until neither of those is running.
+    login_verification_lock = asyncio.Lock()
+    login_verification_tasks = set()
+
+    async def _wait_until_browser_is_free(deadline):
+        loop = asyncio.get_running_loop()
+        while loop.time() < deadline:
+            if not task_run_lock_status().get("running") and not get_login_lock():
+                return True
+            await asyncio.sleep(LOGIN_VERIFICATION_IDLE_POLL_SECONDS)
+        return False
+
+    async def _verify_saved_login(account_ref, token, generation="", *, delay=0):
+        loop = asyncio.get_running_loop()
+        if delay:
+            await asyncio.sleep(delay)
+        async with login_verification_lock:
+            # Counted from this account's turn, not from when it was queued.
+            deadline = loop.time() + LOGIN_VERIFICATION_MAX_WAIT_SECONDS
+            if not await _wait_until_browser_is_free(deadline):
+                await asyncio.to_thread(
+                    write_login_verification,
+                    account_ref,
+                    token,
+                    "unverified",
+                    category="busy",
+                    reason="长时间没有空闲的浏览器可用于验证",
+                    generation=generation,
+                )
+                return
+            account = account_by_ref(get_userData(force_reload=True), account_ref)
+            if not account or (account.get("login_verification") or {}).get("token") != token:
+                return
+            if generation and account_identity.account_login_generation(account) != generation:
+                # A newer login superseded this check while it waited (A7).
+                return
+            # Only a page that shows the login is gone pauses the account; a
+            # timeout, a browser error or an unreadable identity is "unverified"
+            # and leaves sending alone (D12/Q4).
+            reason, category = "", ""
+            expected_uid = actual_uid = ""
+            try:
+                await asyncio.wait_for(
+                    verify_account_session(account, auth_only=True),
+                    timeout=LOGIN_VERIFICATION_TIMEOUT_SECONDS,
+                )
+                outcome = "verified"
+            except FriendRefreshError as exc:
+                category = exc.category or CATEGORY_STRUCTURE_CHANGED
+                reason = str(exc)
+                outcome = (
+                    "login_required"
+                    if category in streak_state.LOGIN_FAILURE_CATEGORIES
+                    else "unverified"
+                )
+            except asyncio.TimeoutError:
+                category, reason, outcome = CATEGORY_NETWORK_UNAVAILABLE, "验证登录态超时", "unverified"
+            except Exception as exc:  # noqa: BLE001 - any other failure is not a verdict
+                logger.warning("Background login verification errored: %s", exc)
+                category, reason, outcome = "verification_error", f"验证时出错：{exc}", "unverified"
+            if outcome == "verified":
+                outcome, category, reason, expected_uid, actual_uid = await check_saved_login_identity(account)
+            logger.info(
+                "Background login verification: ref=%s outcome=%s category=%s",
+                account_ref,
+                outcome,
+                category or "",
+            )
+            saved = await asyncio.to_thread(
+                write_login_verification,
+                account_ref,
+                token,
+                outcome,
+                category=category or "",
+                reason=reason or "",
+                expected_uid=expected_uid,
+                actual_uid=actual_uid,
+                generation=generation,
+            )
+            if outcome != "verified" or not saved:
+                return
+            # The save used to start this refresh while the saver still held the
+            # login workspace, so it never ran; here the browser is free.
+            normalized_id = normalize_unique_id(saved.get("unique_id"))
+            if task_run_lock_status().get("running") or get_login_lock():
+                # The browser got busy during the check; the next manual or
+                # post-send refresh will pick the friend list up.
+                return
+            if normalized_id and normalized_id not in _friend_refresh_active:
+                saved_ref = str(saved.get("account_ref") or "")
+                if not saved_ref:
+                    return
+                _friend_refresh_active.add(normalized_id)
+                job = {
+                    **account_identity.login_snapshot(saved),
+                    "state": "running",
+                    "stage": "starting",
+                    "collected": 0,
+                    "startedAt": datetime.now().isoformat(timespec="seconds"),
+                    "previousUpdatedAt": saved.get("friends_cache_updated_at", ""),
+                }
+                friend_refresh_jobs[saved_ref] = job
+                await _run_friend_refresh_job(normalized_id, saved, "", account_ref=saved_ref, job=job)
+
+    def _queue_login_verification(account_ref, token, generation="", *, delay=0):
+        task = asyncio.create_task(
+            _verify_saved_login(account_ref, token, generation, delay=delay)
+        )
+        login_verification_tasks.add(task)
+
+        def finished(done):
+            login_verification_tasks.discard(done)
+            if not done.cancelled() and done.exception():
+                logger.error("Background login verification failed", exc_info=done.exception())
+
+        task.add_done_callback(finished)
+
+    def _requeue_pending_login_verifications():
+        """After a restart, verify again whatever was still being verified."""
+        for account in get_userData(force_reload=True):
+            check = dict(account.get("login_verification") or {})
+            ref = str(account.get("account_ref") or "")
+            if check.get("state") == "verifying" and check.get("token") and ref:
+                _queue_login_verification(
+                    ref,
+                    check["token"],
+                    str(check.get("generation") or ""),
+                    delay=LOGIN_VERIFICATION_RESTART_DELAY_SECONDS,
+                )
+
+    @app.post("/accounts/{unique_id}/friends/refresh/async")
+    async def refresh_account_friend_list_async(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
+
+        _, account, access_error = account_for_request(
+            request, unique_id, require_generation_for_explicit_ref=True
+        )
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+
+        normalized_id = normalize_unique_id(unique_id)
+        account_ref = str(account.get("account_ref") or "")
+        if not account_ref:
+            return JSONResponse({"error": "Account not found."}, status_code=404)
+        if task_run_lock_status().get("running"):
+            # A send run drives its own browser per account; starting a refresh
+            # at the same time would fight over the same profile.
+            return JSONResponse(
+                {
+                    "error": "发送任务正在运行，为避免与发送流程同时驱动同一账号的浏览器，请稍后再刷新。",
+                    "category": "busy",
+                    "retryable": True,
+                },
+                status_code=409,
+                headers={"Retry-After": "30"},
+            )
+        conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            return JSONResponse(
+                {"error": conflict, "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "5"},
+            )
+
+        _friend_refresh_active.add(normalized_id)
+        job = {
+            **account_identity.login_snapshot(account),
+            "state": "running",
+            "stage": "starting",
+            "collected": 0,
+            "startedAt": datetime.now().isoformat(timespec="seconds"),
+            "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+        }
+        friend_refresh_jobs[account_ref] = job
+        _launch_friend_refresh_task(
+            _run_friend_refresh_job, normalized_id, dict(account), principal(request).get("username", ""),
+            account_ref=account_ref, job=job,
+        )
+        return JSONResponse(
+            {"ok": True, "state": "running", "job": dict(friend_refresh_jobs[account_ref])},
+            status_code=202,
+        )
+
+    @app.get("/accounts/{unique_id}/friends/refresh/status")
+    async def refresh_account_friend_list_status(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        _, account, access_error = await asyncio.to_thread(account_for_request, request, unique_id)
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+
+        account_ref = str(account.get("account_ref") or "")
+        job = friend_refresh_jobs.get(account_ref)
+        if job is None or not account_identity.same_login_snapshot(account, job):
+            return JSONResponse(
+                {
+                    "state": "idle",
+                    "stage": "idle",
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                }
+            )
+        return JSONResponse(dict(job))
+
+    group_refresh_jobs: dict[str, dict] = {}
+
+    async def _run_group_refresh_job(account_ref, normalized_id, account):
+        try:
+            groups = await asyncio.wait_for(fetch_account_groups(account), timeout=_FRIEND_REFRESH_TIMEOUT_SECONDS)
+            if not groups:
+                raise RuntimeError('未读到群列表')
+            updated_at = datetime.now().isoformat(timespec="seconds")
+            def mutate(accounts):
+                target = account_by_ref(accounts, account_ref)
+                if not account_identity.same_login_snapshot(target, account):
+                    return None, False
+                target['group_cache'] = list(groups); target['group_cache_updated_at'] = updated_at
+                names = {item['conversationId']: item['name'] for item in groups}
+                notices = dict(target.get('group_target_notices') or {})
+                statuses = []
+                for target_name, cid in dict(target.get('group_target_bindings') or {}).items():
+                    name = names.get(str(cid))
+                    if name is None: statuses.append({'target':target_name,'status':'missing'}); notices[target_name]={'kind':'missing','at':updated_at}
+                    else:
+                        _, configured_name = parse_chat_target(target_name)
+                        suffix = f'#{str(cid)[-4:]}'
+                        if configured_name.endswith(suffix):
+                            configured_name = configured_name[:-len(suffix)]
+                        if _normalize_target_name(name) != _normalize_target_name(configured_name):
+                            statuses.append({'target':target_name,'status':'renamed','name':name}); notices[target_name]={'kind':'renamed','currentName':name,'at':updated_at}
+                        else:
+                            statuses.append({'target':target_name,'status':'ok'}); notices.pop(target_name, None)
+                target['group_target_notices'] = notices
+                return statuses, True
+            statuses = await asyncio.to_thread(update_user_data, mutate, force_reload=True)
+            if statuses is None:
+                group_refresh_jobs[account_ref].update(state='failed', stage='changed', error='账号已更新或移除，本次旧刷新结果未保存。', category='account_changed', retryable=True)
+                return
+            group_refresh_jobs[account_ref].update(state='done', stage='done', groups=groups, updatedAt=updated_at, targets=statuses or [], message=f'已刷新 {len(groups)} 个群聊')
+        except Exception as exc:
+            group_refresh_jobs[account_ref].update(state='failed', stage='failed', error=str(exc))
+        finally: _group_refresh_active.discard(normalized_id)
+
+    @app.post('/accounts/{unique_id}/groups/refresh/async')
+    async def refresh_groups_async(request: Request, unique_id: str):
+        if require_user(request): return JSONResponse({'error':'Unauthorized'}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get('csrf_token',''))): return JSONResponse({'error':'Invalid CSRF token'}, status_code=403)
+        _, account, access_error = account_for_request(
+            request, unique_id, require_generation_for_explicit_ref=True
+        )
+        if access_error: return JSONResponse({'error':'Forbidden'}, status_code=access_error.status_code)
+        normalized_id = normalize_unique_id(unique_id)
+        conflict = '该账号正在发送任务中，请稍后重试' if task_run_lock_status().get('running') else ''
+        if not conflict and normalized_id in _group_refresh_active:
+            conflict = '该账号已有群列表刷新正在进行，请稍后重试'
+        if not conflict:
+            # Same shared check friend refresh and patrol use (friend refresh,
+            # patrol, login workspace): all of them drive this account's browser.
+            conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            return JSONResponse({'error': conflict, 'category': 'busy'}, status_code=409)
+        account_ref = str(account.get('account_ref') or '')
+        if not account_ref:
+            return JSONResponse({'error': 'Account not found.'}, status_code=404)
+        _group_refresh_active.add(normalized_id); group_refresh_jobs[account_ref]={**account_identity.login_snapshot(account), 'state':'running','stage':'starting','previousUpdatedAt':account.get('group_cache_updated_at','')}
+        _start_background(_run_group_refresh_job(account_ref, normalized_id, dict(account)))
+        return JSONResponse({'ok':True,'state':'running'}, status_code=202)
+
+    @app.get('/accounts/{unique_id}/groups/refresh/status')
+    async def refresh_groups_status(request: Request, unique_id: str):
+        if require_user(request): return JSONResponse({'error':'Unauthorized'}, status_code=401)
+        _, account, access_error = await asyncio.to_thread(account_for_request, request, unique_id)
+        if access_error: return JSONResponse({'error':'Forbidden'}, status_code=access_error.status_code)
+        account_ref = str(account.get('account_ref') or '')
+        job = group_refresh_jobs.get(account_ref)
+        if not job or not account_identity.same_login_snapshot(account, job):
+            job = {'state':'idle','previousUpdatedAt':account.get('group_cache_updated_at','')}
+        return JSONResponse(dict(job))
+
+    # "Immediate patrol" for one account. Same permission and CSRF checks as
+    # the friend refresh; the patrol itself runs in the background and shares
+    # the per-account browser lock with the sender and the refresher.
+    patrol_jobs: dict[str, dict] = {}
+
+    async def _run_patrol_job(account_ref, normalized_id):
+        try:
+            outcome = await account_patrol.run_patrol(
+                [account_ref],
+                trigger="manual",
+            )
+            results = list((outcome or {}).get("accounts") or [])
+            result = results[0] if results else {}
+            job = patrol_jobs.get(account_ref)
+            if job is not None:
+                job.update(
+                    {
+                        "state": "done" if result else "failed",
+                        "conclusion": str(result.get("conclusion") or ""),
+                        "conclusionLabel": account_patrol.CONCLUSION_LABELS.get(
+                            str(result.get("conclusion") or ""), ""
+                        ),
+                        "reason": str(result.get("reason") or ("" if result else "账号未启用或已不存在")),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - reported on the job only
+            logger.warning("Manual patrol failed for %s: %s", normalized_id, type(exc).__name__, exc_info=True)
+            job = patrol_jobs.get(account_ref)
+            if job is not None:
+                job.update({"state": "failed", "reason": f"巡查出错：{type(exc).__name__}"})
+        finally:
+            job = patrol_jobs.get(account_ref)
+            if job is not None:
+                job["finishedAt"] = datetime.now().isoformat(timespec="seconds")
+            _patrol_active.discard(normalized_id)
+
+    @app.post("/accounts/{unique_id}/patrol")
+    async def patrol_account_now(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
+
+        _, account, access_error = account_for_request(
+            request, unique_id, require_generation_for_explicit_ref=True
+        )
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+        if not account.get("enabled", True):
+            return JSONResponse(
+                {"error": "账号已停用，巡查只检查启用的账号。", "category": "disabled"},
+                status_code=409,
+            )
+
+        normalized_id = normalize_unique_id(unique_id)
+        if task_run_lock_status().get("running"):
+            # A send run drives its own browser per account; same rule as the
+            # friend refresh.
+            return JSONResponse(
+                {
+                    "error": "发送任务正在运行，为避免与发送流程同时驱动同一账号的浏览器，请稍后再巡查。",
+                    "category": "busy",
+                    "retryable": True,
+                },
+                status_code=409,
+                headers={"Retry-After": "30"},
+            )
+        if normalized_id in _patrol_active:
+            return JSONResponse(
+                {"error": "该账号已有巡查正在进行，请稍后再试", "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "10"},
+            )
+        conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            return JSONResponse(
+                {"error": conflict, "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "5"},
+            )
+
+        account_ref = str(account.get("account_ref") or "")
+        if not account_ref:
+            return JSONResponse({"error": "Account not found."}, status_code=404)
+        _patrol_active.add(normalized_id)
+        patrol_jobs[account_ref] = {
+            **account_identity.login_snapshot(account),
+            "state": "running",
+            "startedAt": datetime.now().isoformat(timespec="seconds"),
+        }
+        _start_background(_run_patrol_job(account_ref, normalized_id))
+        return JSONResponse(
+            {"ok": True, "state": "running", "job": dict(patrol_jobs[account_ref])},
+            status_code=202,
+        )
+
+    @app.get("/accounts/{unique_id}/patrol/status")
+    async def patrol_account_status(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        _, account, access_error = account_for_request(request, unique_id)
+        if access_error:
+            return JSONResponse(
+                {"error": "Forbidden" if access_error.status_code == 403 else "Account not found."},
+                status_code=access_error.status_code,
+            )
+        account_ref = str(account.get("account_ref") or "")
+        job = patrol_jobs.get(account_ref)
+        if job is None or not account_identity.same_login_snapshot(account, job):
+            job = {"state": "idle"}
+        else:
+            job = dict(job)
+        job["latest"] = account_patrol.patrol_view(account)
+        return JSONResponse(job)
 
     @app.post("/accounts/{unique_id}/friends/refresh")
     async def refresh_account_friend_list(request: Request, unique_id: str):
@@ -802,28 +3081,428 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return JSONResponse({"error": "Invalid CSRF token"}, status_code=403)
 
-        accounts, account, access_error = account_for_request(request, unique_id)
+        _, account, access_error = account_for_request(
+            request, unique_id, require_generation_for_explicit_ref=True
+        )
         if access_error:
             return JSONResponse({"error": "Forbidden" if access_error.status_code == 403 else "Account not found."}, status_code=access_error.status_code)
 
-        try:
-            friends = await fetch_account_friends(account)
-            account["friends_cache"] = friends
-            account["friends_cache_updated_at"] = datetime.now().isoformat(timespec="seconds")
-            save_userData(accounts)
+        normalized_id = normalize_unique_id(unique_id)
+        account = dict(account, _refresh_snapshot=account_identity.login_snapshot(account))
+        if task_run_lock_status().get("running"):
             return JSONResponse(
                 {
-                    "friends": friends,
-                    "updated_at": account["friends_cache_updated_at"],
-                    "message": f"已刷新 {len(friends)} 个好友",
-                }
+                    "error": "发送任务正在运行，为避免与发送流程同时驱动同一账号的浏览器，请稍后再刷新。",
+                    "category": "busy",
+                    "retryable": True,
+                },
+                status_code=409,
+                headers={"Retry-After": "30"},
+            )
+        conflict = friend_refresh_conflict(normalized_id)
+        if conflict:
+            # 429 keeps the caller's account data untouched and tells the caller
+            # to retry later; no second browser is started.
+            return JSONResponse(
+                {"error": conflict, "category": "busy", "retryable": True},
+                status_code=429,
+                headers={"Retry-After": "5"},
+            )
+
+        _friend_refresh_active.add(normalized_id)
+        try:
+            friends = await asyncio.wait_for(
+                fetch_account_friends(account),
+                timeout=_FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Friend refresh timed out for %s after %ss",
+                account.get("username", normalized_id),
+                _FRIEND_REFRESH_TIMEOUT_SECONDS,
+            )
+            return JSONResponse(
+                {
+                    # Exceeding the read budget is an incomplete read, not a
+                    # transport failure, so the console reports it as such.
+                    **_incomplete_scan_fields(
+                        f"读取超时，超过 {_FRIEND_REFRESH_TIMEOUT_SECONDS} 秒"
+                    ),
+                    "scan_complete": False,
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                },
+                status_code=504,
+            )
+        except FriendRefreshError as exc:
+            category = exc.category or CATEGORY_STRUCTURE_CHANGED
+            logger.warning(
+                "Friend refresh failed for %s category=%s: %s",
+                account.get("username", normalized_id),
+                category,
+                exc,
+            )
+            status_code = 401 if category == CATEGORY_LOGIN_REQUIRED else 502
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "category": category,
+                    "categoryLabel": CATEGORY_LABELS.get(category, CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED]),
+                    "retryable": category != CATEGORY_LOGIN_REQUIRED,
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                },
+                status_code=status_code,
             )
         except RuntimeError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "category": CATEGORY_STRUCTURE_CHANGED,
+                    "categoryLabel": CATEGORY_LABELS[CATEGORY_STRUCTURE_CHANGED],
+                    "retryable": True,
+                    "previousUpdatedAt": account.get("friends_cache_updated_at", ""),
+                },
+                status_code=502,
+            )
+        finally:
+            _friend_refresh_active.discard(normalized_id)
+
+        previous_updated_at = account.get("friends_cache_updated_at", "")
+        previous_cache = list(account.get("friends_cache") or [])
+        scan_complete = bool(getattr(friends, "complete", False))
+        scan_reason = str(getattr(friends, "reason", "") or "")
+        if not scan_complete:
+            # A read that stopped early is not proof the list shrank, so it must
+            # never replace the last good cache or rebuild the send index.
+            logger.warning(
+                "Friend refresh incomplete for %s: count=%s reason=%s",
+                account.get("username", normalized_id),
+                len(friends),
+                scan_reason or "-",
+            )
+            return JSONResponse(
+                {
+                    **_incomplete_scan_fields(scan_reason),
+                    "scan_complete": False,
+                    "previousUpdatedAt": previous_updated_at,
+                },
+                status_code=502,
+            )
+        if not friends:
+            # An empty read is not proof that the friend list is empty, so keep
+            # whatever we had and let the operator retry instead of wiping the
+            # friend picker with a single flaky read.
+            logger.warning(
+                "Friend refresh returned no names for %s (complete=%s); keeping %s cached friends",
+                account.get("username", normalized_id),
+                scan_complete,
+                len(previous_cache),
+            )
+            return JSONResponse(
+                {
+                    "error": "本次没有读到任何好友，已保留上一次的好友数据；请稍后重试，或先确认该账号登录态。",
+                    "category": CATEGORY_EMPTY_RESULT,
+                    "categoryLabel": CATEGORY_LABELS[CATEGORY_EMPTY_RESULT],
+                    "retryable": True,
+                    "previousUpdatedAt": previous_updated_at,
+                },
+                status_code=502,
+            )
+
+        updated_at = datetime.now().isoformat(timespec="seconds")
+
+        def mutate(updated_account, accounts):
+            del accounts
+            if not account_identity.same_login_snapshot(updated_account, account["_refresh_snapshot"]):
+                raise account_identity.AccountChangedConcurrently("账号已更新或移除，本次旧刷新结果未保存。")
+            updated_account["friends_cache"] = friends
+            updated_account["friends_cache_updated_at"] = updated_at
+            return None
+
+        try:
+            _, _, access_error = await asyncio.to_thread(
+                mutate_account_for_request,
+                request,
+                unique_id,
+                mutate,
+                account_ref=account["_refresh_snapshot"].get("account_ref") or None,
+                login_generation=account["_refresh_snapshot"].get("login_generation", ""),
+                generation_present=True,
+            )
+        except account_identity.AccountChangedConcurrently as exc:
+            return JSONResponse({"error": str(exc), "category": "account_changed", "retryable": True}, status_code=409)
+        if access_error:
+            if access_error == 409:
+                return JSONResponse({"error": "账号已更新或移除，本次旧刷新结果未保存。", "category": "account_changed", "retryable": True}, status_code=409)
+            return JSONResponse(
+                {"error": "Forbidden" if access_error == 403 else "Account not found."},
+                status_code=access_error,
+            )
+
+        index_updated = False
+        if scan_complete and friends:
+            try:
+                recorded = await asyncio.to_thread(
+                    record_friend_scan, account,
+                    friends,
+                    scan_complete=True,
+                    targets=account.get("targets") or [],
+                )
+                index_updated = recorded is not False
+            except Exception:
+                logger.warning(
+                    "Friend index update after refresh failed for %s",
+                    account.get("username", normalized_id),
+                    exc_info=True,
+                )
+        identity = await asyncio.to_thread(_record_friend_identity, account, friends) if index_updated else {}
+
+        if not await asyncio.to_thread(_refresh_snapshot_is_current, account["_refresh_snapshot"]):
+            return JSONResponse({"error": "账号已更新或移除，本次旧刷新结果未保存。", "category": "account_changed", "retryable": True}, status_code=409)
+
+        logger.info(
+            "Friend refresh stored for %s: count=%s complete=%s index_updated=%s",
+            account.get("username", normalized_id),
+            len(friends),
+            scan_complete,
+            index_updated,
+        )
+        return JSONResponse(
+            {
+                "friends": friends,
+                "updated_at": updated_at,
+                "previous_updated_at": previous_updated_at,
+                "scan_complete": scan_complete,
+                "index_updated": index_updated,
+                "identity": identity,
+                "message": f"已刷新 {len(friends)} 个好友"
+                + ("，并已重建发送索引" if index_updated else ""),
+            }
+        )
+
+    @app.post("/accounts/{unique_id}/merge-into")
+    async def merge_duplicate_account(request: Request, unique_id: str):
+        """Move the targets and ledgers of a duplicate row into the row to keep."""
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"redirect": "/login"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            flash(request, "合并失败：页面已过期，请刷新后重试。", "error")
+            return redirect("/accounts")
+
+        submitted_ref = str(form.get("account_ref", "")).strip()
+        submitted_generation = str(form.get("login_generation", ""))
+        target_ref = str(form.get("target_account_ref", "")).strip()
+        target_generation = str(form.get("target_login_generation", ""))
+        _, source, access_error = account_for_request(
+            request,
+            unique_id,
+            account_ref=submitted_ref or None,
+            login_generation=submitted_generation,
+            require_generation_for_explicit_ref=True,
+            generation_present="login_generation" in form,
+        )
+        if access_error:
+            return PlainTextResponse(
+                "Account login changed" if access_error.status_code == 409 else "Forbidden" if access_error.status_code == 403 else "Account not found",
+                status_code=access_error.status_code,
+            )
+
+        accounts, _ = ensure_account_refs(get_userData(force_reload=True))
+        target = account_by_ref(accounts, target_ref)
+        if not target or not can_access_account(principal(request), target):
+            flash(request, "合并失败：要保留的账号不存在或无权访问。", "error")
+            return redirect("/accounts")
+        if target_ref and ("target_login_generation" not in form or not target or account_identity.account_login_generation(target) != target_generation):
+            return PlainTextResponse("Account login changed", status_code=409)
+
+        source_name = str(source.get("username") or "").strip()
+        target_name = str(target.get("username") or "").strip()
+        if not source_name or source_name != target_name:
+            # Same nickname is the whole point: it is what makes two rows look
+            # like one account, and merging different people would be data loss.
+            flash(request, "合并失败：只能合并昵称相同的账号，请确认这两条确实是同一个账号。", "error")
+            return redirect("/accounts")
+        if source is target:
+            flash(request, "合并失败：请选择另一条账号记录。", "error")
+            return redirect("/accounts")
+
+        source_snapshot = account_identity.login_snapshot(source)
+        target_snapshot = account_identity.login_snapshot(target)
+        current = principal(request)
+        merge_issue = None
+        access_changed = False
+        live_principal = None
+        removed_ownership = {}
+
+        def merge_by_ref(rows):
+            nonlocal merge_issue, access_changed, removed_ownership
+            live_source = account_by_ref(rows, submitted_ref or str(source.get("account_ref") or ""))
+            live_target = account_by_ref(rows, target_ref)
+            if not live_source or not live_target or live_source is live_target:
+                return None, False
+            if not can_access_account(live_principal, live_source) or not can_access_account(live_principal, live_target):
+                access_changed = True
+                return None, False
+            if (
+                not account_identity.same_login_snapshot(live_source, source_snapshot)
+                or not account_identity.same_login_snapshot(live_target, target_snapshot)
+                or str(live_source.get("username") or "").strip() != str(live_target.get("username") or "").strip()
+            ):
+                return None, False
+
+            def safety_map(row, key):
+                nonlocal merge_issue
+                value = row.get(key)
+                if value is None:
+                    return {}
+                if not isinstance(value, dict):
+                    merge_issue = f"{key} is unreadable"
+                    return None
+                return value
+
+            def cleanup_blocked(row):
+                failure = row.get("account_failure")
+                return bool(row.get("browser_cleanup_blocked")) or (
+                    isinstance(failure, dict)
+                    and failure.get("category") == "browser_cleanup_blocked"
+                )
+
+            if cleanup_blocked(live_source) or cleanup_blocked(live_target):
+                merge_issue = "browser cleanup is pending verification"
+                return None, False
+
+            maps = {}
+            for key in (
+                "target_states", "target_refs", "friend_index", "friend_index_meta",
+                "message_history", "friend_uids", "target_uid_bindings",
+                "group_target_bindings", "group_target_notices", "refusal_retry_reservations",
+            ):
+                source_map = safety_map(live_source, key)
+                target_map = safety_map(live_target, key)
+                if source_map is None or target_map is None:
+                    return None, False
+                maps[key] = (source_map, target_map)
+
+            # State, target identity, and retry quota collisions cannot be chosen
+            # by preference: choosing either row could reopen a send or bind it to
+            # a different person/group.  Keep both records for manual review.
+            for key in (
+                "target_states", "target_refs", "friend_uids", "target_uid_bindings",
+                "group_target_bindings", "refusal_retry_reservations",
+            ):
+                source_map, target_map = maps[key]
+                if any(name in target_map and target_map[name] != value for name, value in source_map.items()):
+                    merge_issue = f"conflicting {key}"
+                    return None, False
+
+            source_cache = live_source.get("group_cache") or []
+            target_cache = live_target.get("group_cache") or []
+            if not isinstance(source_cache, list) or not isinstance(target_cache, list):
+                merge_issue = "group cache is unreadable"
+                return None, False
+
+            targets = list(live_target.get("targets") or [])
+            for name in live_source.get("targets") or []:
+                if name not in targets:
+                    targets.append(name)
+            live_target["targets"] = targets
+            for key, (source_map, target_map) in maps.items():
+                merged_map = dict(target_map)
+                for name, value in source_map.items():
+                    merged_map.setdefault(name, value)
+                if merged_map:
+                    live_target[key] = merged_map
+
+            merged_cache = list(target_cache)
+            known_conversations = {
+                str(item.get("conversationId") or "").strip()
+                for item in target_cache if isinstance(item, dict)
+            } - {""}
+            for item in source_cache:
+                conversation_id = (
+                    str(item.get("conversationId") or "").strip()
+                    if isinstance(item, dict) else ""
+                )
+                if not conversation_id or conversation_id not in known_conversations:
+                    merged_cache.append(item)
+                    if conversation_id:
+                        known_conversations.add(conversation_id)
+            if merged_cache:
+                live_target["group_cache"] = merged_cache
+                if not target_cache and live_source.get("group_cache_updated_at"):
+                    live_target["group_cache_updated_at"] = live_source["group_cache_updated_at"]
+
+            if live_source.get("enabled") and not live_target.get("enabled"):
+                live_target["enabled"] = True
+            if not (live_target.get("friends_cache") or []) and (live_source.get("friends_cache") or []):
+                live_target["friends_cache"] = list(live_source.get("friends_cache") or [])
+                if live_source.get("friends_cache_updated_at"):
+                    live_target["friends_cache_updated_at"] = live_source["friends_cache_updated_at"]
+
+            source_ref = str(live_source.get("account_ref") or "").strip()
+            if source_ref:
+                # We hold the web-user lock before update_user_data's account lock.
+                # If the account write fails, the outer handler restores exactly
+                # this snapshot while still holding that lock.
+                _, removed_ownership = remove_account_refs_from_users(
+                    {source_ref}, return_removed=True,
+                )
+            rows.remove(live_source)
+            return dict(live_target), True
+
+        def merge_with_ownership_cleanup():
+            nonlocal live_principal
+            # Match delete's lock order so an ownership reassignment cannot race
+            # this source-row removal and leave a dangling account reference.
+            from webui.users import _web_users_lock, restore_account_refs_to_users
+
+            with _web_users_lock():
+                try:
+                    live = principal(request)
+                    if not live or any(
+                        live.get(key) != current.get(key)
+                        for key in ("username", "role", "session_id")
+                    ):
+                        return None, False, "authentication changed"
+                    live_principal = live
+                    merged, changed = update_user_data(
+                        merge_by_ref, force_reload=True, return_changed=True,
+                    )
+                    return merged, changed, None
+                except Exception:
+                    if removed_ownership:
+                        restore_account_refs_to_users(removed_ownership)
+                    raise
+
+        merged, changed, access_issue = merge_with_ownership_cleanup()
+        if access_issue or access_changed:
+            return PlainTextResponse("Authentication changed", status_code=401)
+        if merge_issue:
+            return PlainTextResponse(
+                f"Merge requires manual review: {merge_issue}", status_code=409,
+            )
+        if not changed:
+            flash(request, "合并失败：账号可能已被其他操作改动，请刷新后重试。", "error")
+            return redirect("/accounts")
+        logger.info(
+            "Merged duplicate account: kept_uid=%s removed_uid=%s targets=%s",
+            normalize_unique_id(target.get("unique_id")),
+            normalize_unique_id(source.get("unique_id")),
+            len(merged.get("targets") or []) if merged else 0,
+        )
+        flash(
+            request,
+            f"已合并重复账号：目标已并入保留账号，现有 {len((merged or {}).get('targets') or [])} 个目标。",
+            "success",
+        )
+        return redirect("/accounts")
 
     @app.post("/accounts/{unique_id}/delete")
     async def delete_account(request: Request, unique_id: str):
-        maybe_redirect = require_admin(request)
+        # Any user may delete an account they own; mutate_account_for_request
+        # rejects the rest with 403. Admin still deletes anything.
+        maybe_redirect = require_user(request)
         if maybe_redirect:
             return maybe_redirect
 
@@ -831,16 +3510,73 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        accounts, account, access_error = account_for_request(request, unique_id)
+        submitted_ref = str(form.get("account_ref", "")).strip()
+        submitted_generation = str(form.get("login_generation", ""))
+        current = principal(request)
+        if not current:
+            return PlainTextResponse("Unauthorized", status_code=401)
+
+        def delete_with_ownership_cleanup():
+            # The web-user lock must always precede usersData.lock.  Login
+            # binding already follows that order; keeping it here prevents a
+            # binding and delete from each waiting on the other's store lock.
+            from webui.users import _web_users_lock, restore_account_refs_to_users
+
+            removed_ownership = {}
+            with _web_users_lock():
+                try:
+                    # Re-resolve while the ownership store is locked: an
+                    # administrator may have revoked or reassigned this row
+                    # after the request passed its first authentication check.
+                    live = principal(request)
+                    if not live or any(
+                        live.get(key) != current.get(key)
+                        for key in ("username", "role", "session_id")
+                    ):
+                        return None, None, 401
+
+                    def mutate(account, accounts):
+                        nonlocal removed_ownership
+                        ref = str(account.get("account_ref", "")).strip()
+                        # A delete is scoped to the resolved record. Historical
+                        # rows can share one UID, but must never be bulk-deleted.
+                        accounts.remove(account)
+                        if ref:
+                            # Remove ownership before the account write so no
+                            # persisted state can contain a dangling reference.
+                            # The exact lists are retained for compensation if
+                            # usersData cannot be saved.
+                            _, removed_ownership = remove_account_refs_from_users(
+                                {ref}, return_removed=True,
+                            )
+                        return None
+
+                    return mutate_account_for_request(
+                        request,
+                        unique_id,
+                        mutate,
+                        account_ref=submitted_ref or None,
+                        login_generation=submitted_generation,
+                        generation_present="login_generation" in form,
+                    )
+                except Exception:
+                    if removed_ownership:
+                        # The user lock remains held, so compensation cannot
+                        # overwrite a concurrent administrator reassignment.
+                        restore_account_refs_to_users(removed_ownership)
+                    raise
+
+        account, _, access_error = delete_with_ownership_cleanup()
         if access_error:
-            return access_error
-        updated_accounts = [item for item in accounts if normalize_unique_id(item.get("unique_id")) != normalize_unique_id(unique_id)]
-        if len(updated_accounts) != len(accounts):
-            save_userData(updated_accounts)
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
+        if account:
             flash(request, "Account deleted.", "success")
         else:
             flash(request, "Account not found.", "error")
-        return redirect("/")
+        return redirect("/accounts")
 
     @app.post("/accounts/{unique_id}/retry-target")
     async def retry_account_target(request: Request, unique_id: str):
@@ -857,7 +3593,13 @@ def create_app():
             flash(request, "Target is required for retry.", "error")
             return redirect("/ops/send-console")
 
-        accounts, account, access_error = account_for_request(request, unique_id)
+        accounts, account, access_error = account_for_request(
+            request, unique_id,
+            account_ref=str(form.get("account_ref") or request.query_params.get("ref") or "").strip() or None,
+            login_generation=str(form.get("login_generation") if "login_generation" in form else request.query_params.get("generation", "")),
+            require_generation_for_explicit_ref=True,
+            generation_present="login_generation" in form or "generation" in request.query_params,
+        )
         if access_error:
             return access_error
 
@@ -868,17 +3610,54 @@ def create_app():
 
         account_copy = dict(account)
         account_copy["targets"] = [target_name]
-        config = get_config(force_reload=True)
-        config["taskCount"] = 1
+        config = manual_retry_config(get_config(force_reload=True))
+        channel = manual_retry_channel(config)
+        run_id = uuid.uuid4().hex
+        started_at = datetime.now(timezone.utc)
+        run_status = "completed"
 
         try:
-            with task_run_lock():
-                await run_browser_tasks(config, [account_copy])
-        except Exception as exc:
-            flash(request, f"Retry failed for {account.get('username', 'Account')} / {target_name}: {exc}", "error")
-            return redirect("/ops/send-console")
+            try:
+                with task_run_lock():
+                    # The retry has to use the same channel as the scheduled run;
+                    # a browser-only retry would contradict a protocol-primary
+                    # deployment and record evidence the operator cannot trust.
+                    if channel == "protocol":
+                        await run_protocol_tasks(
+                            config,
+                            [account_copy],
+                            None,
+                            run_id=run_id,
+                            allow_retry=True,
+                        )
+                    else:
+                        await run_browser_tasks(
+                            config,
+                            [account_copy],
+                            run_id=run_id,
+                            allow_retry=True,
+                        )
+            except Exception as exc:
+                run_status = "failed"
+                flash(request, f"Retry failed for {account.get('username', 'Account')} / {target_name}: {exc}", "error")
+                return redirect("/ops/send-console")
+        finally:
+            try:
+                _append_streak_run_report(
+                    run_id,
+                    started_at,
+                    config,
+                    get_userData(force_reload=True),
+                    run_status=run_status,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to append manual streak retry report for %s / %s",
+                    account.get("username", "Account"),
+                    target_name,
+                )
 
-        updated_account = find_account(get_userData(force_reload=True), unique_id) or {}
+        updated_account = streak_state.find_matching_account(get_userData(force_reload=True), account_copy) or {}
         if _target_sent_today(updated_account, target_name):
             flash(request, f"已重试 {account.get('username', 'Account')} / {target_name}，并获得强证据确认。", "success")
         elif _target_unconfirmed_today(updated_account, target_name):
@@ -889,7 +3668,14 @@ def create_app():
             account_failure = dict(updated_account.get("account_failure") or {})
             affected_targets = list(account_failure.get("affectedTargets") or [])
             failure_entry = dict(updated_account.get("failure_queue") or {}).get(target_name) or {}
-            if target_name in affected_targets:
+            if any(
+                streak_state.target_keys_match(
+                    updated_account,
+                    target_name,
+                    affected_target,
+                )
+                for affected_target in affected_targets
+            ):
                 reason = str(account_failure.get("reason") or "Account-level browser failure.")
             else:
                 reason = str(failure_entry.get("reason") or "Retry did not confirm a successful send.")
@@ -911,45 +3697,31 @@ def create_app():
             flash(request, "Target is required.", "error")
             return redirect("/ops/send-console")
 
-        accounts, account, access_error = account_for_request(request, unique_id)
-        if access_error:
-            return access_error
+        def mutate(account, accounts):
+            del accounts
+            # The button is only offered for confirmed records, and it must always
+            # take effect: without force, a record from an earlier day was silently
+            # refused, so the click looked successful but changed nothing.
+            return mark_target_unconfirmed(account, target_name, force=True)
 
-        changed = mark_target_unconfirmed(account, target_name)
+        account, changed, access_error = mutate_account_for_request(
+            request,
+            unique_id,
+            mutate,
+            account_ref=str(form.get("account_ref") or request.query_params.get("ref") or "").strip() or None,
+            login_generation=str(form.get("login_generation") if "login_generation" in form else request.query_params.get("generation", "")),
+            generation_present="login_generation" in form or "generation" in request.query_params,
+        )
+        if access_error:
+            return PlainTextResponse(
+                "Forbidden" if access_error == 403 else "Account not found",
+                status_code=access_error,
+            )
+
         if changed:
-            save_userData(accounts)
             flash(request, f"已将 {account.get('username', 'Account')} / {target_name} 标记为待核验/待补发。", "warning")
         else:
-            flash(request, f"{target_name} 已是强确认记录或不是今日记录，未自动重置。", "info")
-        return redirect("/ops/send-console")
-
-    @app.post("/ops/reset-today-unconfirmed")
-    async def reset_today_unconfirmed(request: Request):
-        maybe_redirect = require_admin(request)
-        if maybe_redirect:
-            return maybe_redirect
-
-        form = await request.form()
-        if not validate_csrf(request, str(form.get("csrf_token", ""))):
-            return Response("Invalid CSRF token", status_code=403)
-
-        accounts = get_userData(force_reload=True)
-        changed_count = 0
-        for account in accounts:
-            for target_name in list(account.get("targets") or []):
-                entry = dict(account.get("message_history") or {}).get(target_name) or {}
-                sent_at = _parse_sent_at(entry.get("sentAt"))
-                if not sent_at or sent_at.date() != datetime.now(_schedule_timezone()).date():
-                    continue
-                if _history_entry_strong_confirmed_today(entry):
-                    continue
-                if mark_target_unconfirmed(account, target_name, reason="batch_reset_today_suspicious_success"):
-                    changed_count += 1
-        if changed_count:
-            save_userData(accounts)
-            flash(request, f"已将 {changed_count} 条今日可疑成功记录标记为待核验/待补发。", "warning")
-        else:
-            flash(request, "没有找到需要重置的今日可疑成功记录。", "info")
+            flash(request, f"{target_name} 没有可重置或不是今日记录，未自动重置。", "info")
         return redirect("/ops/send-console")
 
     @app.post("/config")
@@ -962,61 +3734,14 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        config = get_config(force_reload=True)
-        if "messageTemplate" in form:
-            config["messageTemplate"] = str(form.get("messageTemplate", config.get("messageTemplate", "")))
-        if "multiTask" in form:
-            config["multiTask"] = str(form.get("multiTask", "")) == "on"
-        if "taskCount" in form:
-            config["taskCount"] = coerce_int(form.get("taskCount", config.get("taskCount", 1)), config.get("taskCount", 1), 1)
-        if "hitokotoTypes" in form:
-            raw_types = str(form.get("hitokotoTypes", ""))
-            config["hitokotoTypes"] = [item.strip() for item in raw_types.replace(",", "\n").splitlines() if item.strip()]
+        def mutate(config):
+            apply_runtime_config_form(config, form)
+            return None, True
 
-        send_strategy = config.get("sendStrategy", {}) or {}
-        if "shuffleTargets" in form:
-            send_strategy["shuffleTargets"] = str(form.get("shuffleTargets", "")) == "on"
-        if "accountStartDelaySecondsMin" in form:
-            send_strategy["accountStartDelaySecondsMin"] = coerce_int(
-                form.get("accountStartDelaySecondsMin", send_strategy.get("accountStartDelaySecondsMin", 0)),
-                send_strategy.get("accountStartDelaySecondsMin", 0),
-                0,
-            )
-        if "accountStartDelaySecondsMax" in form:
-            send_strategy["accountStartDelaySecondsMax"] = coerce_int(
-                form.get("accountStartDelaySecondsMax", send_strategy.get("accountStartDelaySecondsMax", 0)),
-                send_strategy.get("accountStartDelaySecondsMax", 0),
-                send_strategy.get("accountStartDelaySecondsMin", 0),
-            )
-        if "messageIntervalSecondsMin" in form:
-            send_strategy["messageIntervalSecondsMin"] = coerce_int(
-                form.get("messageIntervalSecondsMin", send_strategy.get("messageIntervalSecondsMin", 0)),
-                send_strategy.get("messageIntervalSecondsMin", 0),
-                0,
-            )
-        if "messageIntervalSecondsMax" in form:
-            send_strategy["messageIntervalSecondsMax"] = coerce_int(
-                form.get("messageIntervalSecondsMax", send_strategy.get("messageIntervalSecondsMax", 0)),
-                send_strategy.get("messageIntervalSecondsMax", 0),
-                send_strategy.get("messageIntervalSecondsMin", 0),
-            )
-        if "messageVariants" in form:
-            raw_variants = str(form.get("messageVariants", ""))
-            send_strategy["messageVariants"] = [
-                item.strip() for item in raw_variants.replace("\r", "\n").split("\n") if item.strip()
-            ]
-        config["sendStrategy"] = send_strategy
-
-        happy_new_year = config.get("happyNewYear", {})
-        if "happyNewYearEnabled" in form:
-            happy_new_year["enabled"] = str(form.get("happyNewYearEnabled", "")) == "on"
-        if "happyNewYearTemplate" in form:
-            happy_new_year["messageTemplate"] = str(form.get("happyNewYearTemplate", happy_new_year.get("messageTemplate", "")))
-        config["happyNewYear"] = happy_new_year
-        save_config(config)
+        update_config(mutate, force_reload=True)
 
         flash(request, "Runtime config saved.", "success")
-        return redirect("/")
+        return redirect("/settings#messages")
 
     @app.post("/settings")
     async def save_panel_settings(request: Request):
@@ -1028,29 +3753,122 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
-        settings = get_app_settings(force_reload=True)
-        settings["compose_root"] = str(form.get("compose_root", settings.get("compose_root", ""))).strip()
-        settings["ops_log_file"] = str(form.get("ops_log_file", settings.get("ops_log_file", ""))).strip()
-        settings["proxy_refresh_script"] = str(form.get("proxy_refresh_script", settings.get("proxy_refresh_script", ""))).strip()
-        settings["login_desktop_api_url"] = str(
-            form.get("login_desktop_api_url", settings.get("login_desktop_api_url", "http://127.0.0.1:18090"))
-        ).strip()
-        network_mode = str(form.get("douyin_network_mode", settings.get("douyin_network_mode", "direct"))).strip().lower()
-        settings["douyin_network_mode"] = network_mode if network_mode in {"direct", "mihomo"} else "direct"
-        settings["douyin_proxy_url"] = str(form.get("douyin_proxy_url", settings.get("douyin_proxy_url", "http://proxy:7890"))).strip()
-        settings["ui_port"] = int(form.get("ui_port", settings.get("ui_port", 8787)))
-        save_app_settings(settings)
+        current = await run_auth_read(principal, request)
+        if not current or current.get("role") != "admin":
+            return PlainTextResponse("Forbidden", status_code=403)
+        if str(form.get("new_password", "")):
+            if not await confirm_password(request, current["username"], str(form.get("current_password", ""))):
+                flash(request, "当前密码不正确或尝试次数过多，设置未保存。", "error")
+                return redirect("/settings#system")
 
-        new_password = str(form.get("new_password", ""))
-        confirm_password = str(form.get("confirm_password", ""))
-        if new_password:
-            if new_password != confirm_password:
-                flash(request, "Admin password was not updated because the confirmation did not match.", "error")
-                return redirect("/")
-            update_admin_password(new_password)
+        ui_port = None
+        if "ui_port" in form:
+            port_text = str(form.get("ui_port", "")).strip()
+            try:
+                ui_port = int(port_text)
+            except (TypeError, ValueError):
+                flash(request, "管理面板端口必须是 1 到 65535 的整数，设置未保存。", "error")
+                return redirect("/settings#system")
+            if not 1 <= ui_port <= 65535:
+                flash(request, "管理面板端口必须在 1 到 65535 之间，设置未保存。", "error")
+                return redirect("/settings#system")
 
-        flash(request, "Panel settings saved.", "success")
-        return redirect("/")
+        def save_settings():
+            from filelock import FileLock
+            from utils.config import app_settings_path
+            with FileLock(f"{app_settings_path()}.admin-change.lock", timeout=30):
+                live = principal(request)
+                if not live or live.get("role") != "admin" or any(live.get(key) != current.get(key) for key in ("username", "session_id")):
+                    return PlainTextResponse("登录状态已变化，请重新登录。", status_code=403)
+                settings = get_app_settings(force_reload=True)
+                settings["compose_root"] = str(form.get("compose_root", settings.get("compose_root", ""))).strip()
+                try:
+                    settings["ops_log_file"] = str(resolve_log_file(str(form.get("ops_log_file", settings.get("ops_log_file", ""))).strip()))
+                except ValueError as exc:
+                    flash(request, str(exc), "error")
+                    return redirect("/settings#system")
+                settings["proxy_refresh_script"] = str(form.get("proxy_refresh_script", settings.get("proxy_refresh_script", ""))).strip()
+                settings["login_desktop_api_url"] = str(
+                    form.get("login_desktop_api_url", settings.get("login_desktop_api_url", "http://127.0.0.1:18090"))
+                ).strip()
+                network_mode = str(form.get("douyin_network_mode", settings.get("douyin_network_mode", "direct"))).strip().lower()
+                settings["douyin_network_mode"] = network_mode if network_mode in {"direct", "mihomo"} else "direct"
+                settings["douyin_proxy_url"] = str(form.get("douyin_proxy_url", settings.get("douyin_proxy_url", "http://proxy:7890"))).strip()
+                if ui_port is not None:
+                    settings["ui_port"] = ui_port
+                new_password = str(form.get("new_password", ""))
+                confirm_new_password = str(form.get("confirm_password", ""))
+                if new_password:
+                    if new_password != confirm_new_password:
+                        flash(request, "Admin password was not updated because the confirmation did not match.", "error")
+                        return redirect("/settings#system")
+                    problem = password_problem(new_password, settings.get("admin_username", "admin"))
+                    if problem:
+                        flash(request, f"管理员密码未修改：{problem}", "error")
+                        return redirect("/settings#system")
+                save_app_settings(settings)
+                if new_password:
+                    update_admin_password(new_password)
+
+                flash(request, "Panel settings saved.", "success")
+                return redirect("/settings#system")
+
+        async with credential_slot(app):
+            return await run_credential_work(save_settings)
+
+    @app.post("/settings/notifications")
+    async def save_notifications(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+
+        def mutate(config):
+            normalized, errors = notify.apply_form(config.get("notifications"), form)
+            if errors:
+                return errors, False
+            config["notifications"] = normalized
+            return errors, True
+
+        errors = update_config(mutate, force_reload=True)
+        if errors:
+            message = "推送设置未保存：" + "；".join(errors)
+            flash(request, message, "error")
+        else:
+            message = "推送设置已保存。"
+            flash(request, message, "success")
+        if request.headers.get("x-requested-with") == "XMLHttpRequest":
+            request.session.pop("flash", None)
+            return JSONResponse({"message": message, "level": "error" if errors else "success"})
+        return redirect("/settings#notify")
+
+    @app.post("/settings/notifications/test")
+    async def test_notification_channel(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return Response("Invalid CSRF token", status_code=403)
+
+        channel = str(form.get("channel", "")).strip()
+        if channel not in notify.CHANNEL_NAMES:
+            flash(request, "未知推送渠道，测试没有发送。", "error")
+            return redirect("/settings#notify")
+
+        # Test uses the saved config, so unsaved edits are not sent.
+        saved = get_config(force_reload=True).get("notifications")
+        ok, message = await asyncio.to_thread(notify.send_test, channel, saved)
+        level = "success" if ok else "error"
+        flash(request, message, level)
+        if request.headers.get("x-requested-with") == "XMLHttpRequest":
+            request.session.pop("flash", None)
+            return JSONResponse({"message": message, "level": level})
+        return redirect("/settings#notify")
 
     @app.post("/ops/run-now")
     async def run_now(request: Request):
@@ -1062,6 +3880,9 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
+        setup_redirect = await require_personal_messages(request)
+        if setup_redirect:
+            return setup_redirect
         refs = principal_account_refs(request)
         pid = run_task_now(force_all=refs is None, account_refs=refs)
         if pid == TASK_ALREADY_RUNNING:
@@ -1082,6 +3903,9 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
+        setup_redirect = await require_personal_messages(request)
+        if setup_redirect:
+            return setup_redirect
         refs = principal_account_refs(request)
         pid = run_failed_retry_now(account_refs=refs)
         if pid == TASK_ALREADY_RUNNING:
@@ -1102,6 +3926,9 @@ def create_app():
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return Response("Invalid CSRF token", status_code=403)
 
+        setup_redirect = await require_personal_messages(request)
+        if setup_redirect:
+            return setup_redirect
         refs = principal_account_refs(request)
         pid = run_unsent_retry_now(account_refs=refs)
         if pid == TASK_ALREADY_RUNNING:
@@ -1113,32 +3940,12 @@ def create_app():
         return redirect("/ops/send-console")
 
     @app.post("/ops/proxy/refresh")
-    async def proxy_refresh(request: Request):
-        maybe_redirect = require_admin(request)
-        if maybe_redirect:
-            return maybe_redirect
-
-        form = await request.form()
-        if not validate_csrf(request, str(form.get("csrf_token", ""))):
-            return Response("Invalid CSRF token", status_code=403)
-
-        refresh_proxy()
-        flash(request, "Proxy subscription refreshed.", "success")
-        return redirect("/")
-
     @app.post("/ops/proxy/restart")
-    async def proxy_restart(request: Request):
+    async def proxy_maintenance_unavailable(request: Request):
         maybe_redirect = require_admin(request)
         if maybe_redirect:
             return maybe_redirect
-
-        form = await request.form()
-        if not validate_csrf(request, str(form.get("csrf_token", ""))):
-            return Response("Invalid CSRF token", status_code=403)
-
-        restart_proxy()
-        flash(request, "Proxy container restarted.", "success")
-        return redirect("/")
+        return PlainTextResponse("Manage the proxy on the server", status_code=403)
 
     @app.post("/ops/schedule")
     async def save_schedule(request: Request):
@@ -1151,12 +3958,43 @@ def create_app():
             return Response("Invalid CSRF token", status_code=403)
 
         time_string = str(form.get("daily_schedule", "")).strip()
+        window_state = schedule_window_state()
+        if window_state.get("inside"):
+            # Freeze the window while today's window is running: changing it
+            # mid-window would silently retime the rest of the day.
+            flash(
+                request,
+                f"现在是发送窗口 {window_state.get('label')} 内，窗口配置在窗口结束（{int(window_state.get('endHour') or 0):02d}:00）之前不可修改。",
+                "error",
+            )
+            return redirect("/settings#schedule")
         result = update_daily_schedule(time_string)
         if getattr(result, "returncode", 1) == 0:
             flash(request, f"Updated the daily schedule to {time_string}.", "success")
         else:
             flash(request, f"Failed to update the daily schedule to {time_string}: {getattr(result, 'stderr', '')}", "error")
-        return redirect("/")
+        return redirect("/settings#schedule")
+
+    @app.post("/ops/schedule/preview")
+    async def preview_schedule(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return JSONResponse({"ok": False, "error": "Forbidden"}, status_code=403)
+
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+
+        time_string = str(form.get("daily_schedule", "")).strip()
+        try:
+            preview = preview_daily_schedule(time_string)
+        except Exception as exc:
+            logger.warning("Schedule preview failed", exc_info=True)
+            return JSONResponse(
+                {"ok": False, "error": f"预览失败：{exc}"},
+                status_code=500,
+            )
+        return JSONResponse(preview)
 
     @app.get("/ops/logs", response_class=HTMLResponse)
     async def logs_page(request: Request):
@@ -1169,10 +4007,97 @@ def create_app():
             {
                 "flash": pop_flash(request),
                 "log_tail": read_log_tail(400),
+                "log_summary": summarize_log_tail(400),
             },
         )
 
+    @app.get("/ops/logs/download")
+    async def logs_download(request: Request):
+        maybe_redirect = require_admin(request)
+        if maybe_redirect:
+            return maybe_redirect
+        path = log_file_path()
+        if not path.is_file():
+            return PlainTextResponse(
+                "日志文件不存在或尚未产生（定时触发写入任务日志后会生成）。",
+                status_code=404,
+            )
+        return FileResponse(
+            str(path),
+            media_type="text/plain; charset=utf-8",
+            filename=path.name,
+            headers={"Cache-Control": "no-store"},
+        )
+
     login_transition_lock = asyncio.Lock()
+    login_save_lock = asyncio.Lock()
+    binding_operations = BindingOperations()
+    app.state.binding_operations = binding_operations
+    cookie_verification_lock = asyncio.Lock()
+
+    def login_profile_continuity_enabled():
+        """Enable the account-profile rollout only where desktop supports it."""
+        return os.getenv("SPARKFLOW_LOGIN_PROFILE_CONTINUITY", "") == "1"
+
+    def account_profile_for_lease(lease, *, current=None):
+        """Build a desktop selector from the lease immutable account target."""
+        if not login_profile_continuity_enabled() or str(lease.get("mode") or "") != "relogin":
+            return None, ""
+        account_ref = str(lease.get("account_ref") or "")
+        generation = str(lease.get("login_generation") or "")
+        if not account_ref:
+            return None, "重新登录账号已失效，请重新打开页面。"
+        accounts, _ = ensure_account_refs(get_userData(force_reload=True))
+        account = account_by_ref(accounts, account_ref)
+        if not account or account_identity.account_login_generation(account) != generation:
+            return None, "账号已移除或登录已更新，请重新打开页面。"
+        if current is not None:
+            allowed = can_access_account(current, account)
+        else:
+            admin_name = str(get_app_settings().get("admin_username", "admin") or "admin")
+            owner = next((user for user in get_web_users() if user.get("username") == lease.get("username")), None)
+            allowed = str(lease.get("username") or "") == admin_name or bool(
+                owner and owner.get("enabled") and account_ref in set(owner.get("account_refs", []))
+            )
+        unique_id = normalize_unique_id(account.get("unique_id"))
+        if not allowed or not unique_id:
+            return None, "账号权限或身份已变化，请重新打开页面。"
+        return {"unique_id": unique_id, "account_ref": account_ref, "login_generation": generation}, ""
+
+    def engine_expectation_for_login(profile):
+        """Return the server-owned expectation without exposing launch details."""
+        if not fingerprint_browser_enabled():
+            return None
+        profile_name = f"uid-{profile['unique_id']}" if profile else None
+        return resolve_browser_engine(profile_name).expectation()
+
+    def desktop_login_view(payload):
+        """Return only the desktop state the workspace controller needs."""
+        if not isinstance(payload, dict):
+            return {}
+        return {key: payload[key] for key in ("profile_mode", "reusable_session", "state", "logged_in") if key in payload}
+
+    async def open_login_for_lease(lease, *, current=None):
+        profile, error = account_profile_for_lease(lease, current=current)
+        if error:
+            raise RuntimeError(error)
+        if (
+            fingerprint_browser_enabled()
+            and str(lease.get("mode") or "") == "relogin"
+            and not profile
+        ):
+            raise RuntimeError("指纹浏览器要求重新登录使用账号浏览器环境。")
+        payload = {"interaction_key": str(lease.get("ticket") or "")}
+        if profile:
+            payload["account_profile"] = profile
+        expectation = engine_expectation_for_login(profile)
+        if expectation is not None:
+            payload["engine_expectation"] = expectation
+        desktop = await asyncio.to_thread(call_login_desktop, "/open-login", method="POST", payload=payload, timeout=90)
+        # A pre-rollout desktop can accept JSON while silently ignoring the selector.
+        if profile and desktop_login_view(desktop).get("profile_mode") != "account":
+            raise RuntimeError("登录桌面未启用账号浏览器环境，已安全取消本次重新登录。")
+        return desktop_login_view(desktop)
 
     def _workspace_payload(request):
         current = principal(request)
@@ -1200,7 +4125,6 @@ def create_app():
     async def _reset_and_promote(*, force=False, clear_queue=False):
         """Reset the shared browser profile, then activate the next queue item."""
         async with login_transition_lock:
-            state = get_workspace_state()
             if force:
                 transition = begin_login_force_reset(clear_queue=clear_queue)
             else:
@@ -1211,19 +4135,34 @@ def create_app():
                 return True, None
             try:
                 try:
-                    call_login_desktop("/close", method="POST", payload={}, timeout=60)
+                    await asyncio.to_thread(call_login_desktop, "/close", method="POST", payload={}, timeout=60)
                 except RuntimeError:
                     # Older login-desktop images do not have /close; reset is
                     # still safe because it clears the temporary login profile.
-                    call_login_desktop("/reset", method="POST", payload={}, timeout=120)
+                    await asyncio.to_thread(call_login_desktop, "/reset", method="POST", payload={}, timeout=120)
             except RuntimeError as exc:
                 logger.error("Failed to reset login workspace: %s", exc)
                 return False, None
             promoted = finish_login_transition()
             if promoted:
                 try:
-                    call_login_desktop("/open-login", method="POST", payload={}, timeout=90)
+                    await open_login_for_lease(promoted)
                 except RuntimeError as exc:
+                    # The account changed while queued, or an old desktop ignored
+                    # account_profile. The failed opener may already have created
+                    # the wrong browser, so close that exact lease before dropping
+                    # it. Stay fail-closed even when cleanup fails: do not acquire
+                    # the transition lock again or promote a stranger here.
+                    try:
+                        await asyncio.to_thread(call_login_desktop, "/close", method="POST", payload={}, timeout=60)
+                    except RuntimeError:
+                        logger.exception("Failed to close rejected queued login workspace")
+                    begin_login_release(
+                        username=promoted.get("username", ""),
+                        session_id=promoted.get("session_id", ""),
+                        ticket=promoted.get("ticket", ""),
+                        account_ref=promoted.get("account_ref", ""),
+                    )
                     logger.error("Failed to open login workspace for queued user: %s", exc)
                     return False, promoted
             return True, promoted
@@ -1231,10 +4170,30 @@ def create_app():
     async def _expire_login_workspace():
         return await _reset_and_promote()
 
+    release_tasks = set()
+
+    def _reset_and_promote_later():
+        """Release the workspace without making the leaving operator wait.
+
+        Resetting the login browser and opening it for the next queued person
+        takes seconds to tens of seconds; the save or close that triggered it
+        has already finished and must answer now. The watchdog retries a reset
+        that fails here.
+        """
+        task = asyncio.create_task(_reset_and_promote())
+        release_tasks.add(task)
+
+        def finished(done):
+            release_tasks.discard(done)
+            if not done.cancelled() and done.exception():
+                logger.error("Background login workspace release failed", exc_info=done.exception())
+
+        task.add_done_callback(finished)
+
     async def login_workspace_watchdog():
         """Reap abandoned leases even when no browser request arrives."""
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
             try:
                 await _expire_login_workspace()
             except asyncio.CancelledError:
@@ -1268,7 +4227,7 @@ def create_app():
 
     @app.get("/login-desktop/proxy")
     async def login_desktop_proxy_root(request: Request):
-        maybe_redirect = require_user(request)
+        maybe_redirect = require_admin(request)
         if maybe_redirect:
             return maybe_redirect
         lock_error = login_lock_required(request)
@@ -1278,7 +4237,7 @@ def create_app():
 
     @app.get("/login-desktop/proxy/{asset_path:path}")
     async def login_desktop_proxy_asset(request: Request, asset_path: str):
-        maybe_redirect = require_user(request)
+        maybe_redirect = require_admin(request)
         if maybe_redirect:
             return maybe_redirect
         lock_error = login_lock_required(request)
@@ -1300,6 +4259,9 @@ def create_app():
         active = get_login_lock()
         if not current:
             await websocket.close(code=4401)
+            return
+        if current["role"] != "admin":
+            await websocket.close(code=4403)
             return
         if not owns_login_lock(
             active,
@@ -1335,6 +4297,22 @@ def create_app():
                         elif message.get("text") is not None:
                             await upstream.send(message["text"])
 
+                async def watch_workspace():
+                    while True:
+                        await asyncio.sleep(1)
+                        live = current_principal(websocket)
+                        lease = get_login_lock()
+                        if not live or not owns_login_lock(
+                            lease,
+                            username=live.get("username", ""),
+                            session_id=live.get("session_id", ""),
+                        ) or (
+                            lease.get("account_ref") and live.get("role") != "admin"
+                            and lease["account_ref"] not in live.get("account_refs", [])
+                        ):
+                            await websocket.close(code=4403)
+                            return
+
                 async def upstream_to_client():
                     async for message in upstream:
                         if isinstance(message, bytes):
@@ -1342,13 +4320,30 @@ def create_app():
                         else:
                             await websocket.send_text(message)
 
-                await _run_websocket_relays(client_to_upstream(), upstream_to_client())
+                await _run_websocket_relays(client_to_upstream(), upstream_to_client(), watch_workspace())
         except (ConnectionClosed, WebSocketDisconnect):
             pass
         except Exception as exc:
             logger.warning("login desktop WebSocket proxy failed: %s", exc)
             if not accepted:
                 await websocket.close(code=1011)
+
+    def qr_workspace_snapshot(request, submitted):
+        current = principal(request)
+        active = get_login_lock()
+        if not current or not owns_login_lock(active, username=current["username"], session_id=current.get("session_id", "")):
+            return None
+        ticket = str((active or {}).get("ticket") or "")
+        if not submitted.isascii() or len(submitted) > 128 or (shared and not submitted) or (submitted and not secrets.compare_digest(submitted, ticket)):
+            return None
+        return current, ticket
+
+    def qr_workspace_current(request, current, ticket):
+        snapshot = qr_workspace_snapshot(request, ticket)
+        return bool(snapshot and snapshot[1] == ticket and all(snapshot[0].get(key) == current.get(key) for key in ("username", "role", "session_id")))
+
+    def qr_workspace_lost():
+        return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请", "state": "workspace_released"}, status_code=423, headers={"Cache-Control": "no-store"})
 
     @app.get("/login-desktop/qr")
     async def login_desktop_qr(request: Request):
@@ -1358,9 +4353,19 @@ def create_app():
         lock_error = login_lock_required(request)
         if lock_error:
             return lock_error
-        url = f"{login_desktop_api_url()}/qr"
+        snapshot = qr_workspace_snapshot(request, request.headers.get("X-SparkFlow-Workspace", ""))
+        if snapshot is None:
+            return qr_workspace_lost()
+        current, ticket = snapshot
+        # The login service holds the request until a QR code shows up (bounded),
+        # so the page does not have to poll in a tight loop.
+        url = f"{login_desktop_api_url()}/qr?wait={LOGIN_QR_WAIT_SECONDS}"
         try:
-            upstream_request = urllib.request.Request(url, method="GET")
+            upstream_request = urllib.request.Request(
+                url,
+                method="GET",
+                headers={**login_desktop_api_headers(), "X-SparkFlow-Workspace": ticket},
+            )
             def read_qr_response():
                 upstream = urllib.request.urlopen(upstream_request, timeout=20)
                 try:
@@ -1375,24 +4380,118 @@ def create_app():
                     if close:
                         close()
             upstream_status, upstream_headers, content = await asyncio.to_thread(read_qr_response)
-            if upstream_status == 202:
-                retry_after = upstream_headers.get("Retry-After", "2")
-                return JSONResponse(
-                    {"ok": False, "state": "starting", "retry_after": int(retry_after or 2)},
-                    status_code=202,
-                    headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            if not qr_workspace_current(request, current, ticket):
+                return qr_workspace_lost()
+            upstream_content_type = _header_value(upstream_headers, "Content-Type")
+            if upstream_status == 202 or "application/json" in upstream_content_type:
+                # JSON bodies carry a machine-readable QR state (not-generated,
+                # page busy, existing session). Forwarding them as image/png
+                # would show the browser a broken image instead of the reason.
+                retry_after = _header_value(upstream_headers, "Retry-After") or "2"
+                return _qr_state_response(
+                    content,
+                    state="starting",
+                    status_code=upstream_status,
+                    retry_after=retry_after,
                 )
+            if upstream_status in {409, 503}:
+                # Upstream already classified the reason; forward it instead of
+                # collapsing every failure into "service unavailable".
+                return _qr_state_response(content, state="retrying", status_code=upstream_status)
             return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store, max-age=0"})
         except urllib.error.HTTPError as exc:
-            if exc.code in {404, 409, 202}:
-                return JSONResponse(
-                    {"ok": False, "state": "starting", "retry_after": 2},
-                    status_code=202,
-                    headers={"Retry-After": "2", "Cache-Control": "no-store"},
+            if not qr_workspace_current(request, current, ticket) or exc.code == 423:
+                return qr_workspace_lost()
+            if exc.code in {202, 409, 503}:
+                return _qr_state_response(
+                    _safe_json_bytes(exc),
+                    state="retrying",
+                    status_code=exc.code,
+                    retry_after=_header_value(exc.headers, "Retry-After") or "2",
                 )
-            return PlainTextResponse("login QR service is unavailable", status_code=502)
-        except (urllib.error.URLError, TimeoutError):
-            return PlainTextResponse("login QR service is unavailable", status_code=502)
+            # login-desktop answered but could not produce a page: that is the
+            # upstream (Douyin / network) side, not the login service itself.
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "category": "douyin_unreachable",
+                    "message": "无法访问抖音（网络或代理异常），请检查服务器网络后点击“刷新二维码”重试。",
+                },
+                status_code=502,
+                headers={"Cache-Control": "no-store"},
+            )
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if not qr_workspace_current(request, current, ticket):
+                return qr_workspace_lost()
+            reason = getattr(exc, "reason", exc)
+            if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+                # login-desktop is reachable but its single page lock is held
+                # (status checks, page load); that is "busy", worth retrying,
+                # not "the service is down".
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "state": "busy",
+                        "category": "page_busy",
+                        "message": "登录页正在加载或处理其他请求",
+                        "retry_after": 3,
+                    },
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "3"},
+                )
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "category": "service_unavailable",
+                    "message": "登录桌面服务暂时不可用，请稍后点击“刷新二维码”重试。",
+                },
+                status_code=502,
+                headers={"Cache-Control": "no-store"},
+            )
+
+    def _header_value(headers, name):
+        """Read a response header case-insensitively (HTTP header names are)."""
+        if not headers:
+            return ""
+        target = str(name).lower()
+        try:
+            for key, value in headers.items():
+                if str(key).lower() == target:
+                    return str(value)
+        except (AttributeError, TypeError):
+            return ""
+        try:
+            return str(headers.get(name) or "")
+        except (AttributeError, TypeError):
+            return ""
+
+    def _safe_json_bytes(exc):
+        try:
+            return exc.read()
+        except Exception:
+            return b"{}"
+
+    def _qr_state_response(content, *, state, status_code, retry_after=None):
+        payload = {}
+        try:
+            decoded = json.loads(content.decode("utf-8"))
+            if isinstance(decoded, dict):
+                payload = decoded
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            payload = {}
+        payload.setdefault("ok", False)
+        payload.setdefault("state", state)
+        # Upstream already classifies which QR states are retryable; an expired
+        # QR code is not, because only an explicit refresh regenerates it.
+        retryable = bool(payload.get("retryable", status_code in {202, 503}))
+        payload["retryable"] = retryable
+        delay = int(retry_after or payload.get("retry_after") or 2)
+        payload["retry_after"] = delay
+        return JSONResponse(
+            payload,
+            status_code=status_code,
+            headers={"Retry-After": str(delay), "Cache-Control": "no-store"},
+        )
 
     @app.post("/login-desktop/qr/refresh")
     async def login_desktop_qr_refresh(request: Request):
@@ -1405,22 +4504,65 @@ def create_app():
         form = await request.form()
         if not validate_csrf(request, str(form.get("csrf_token", ""))):
             return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
-        heartbeat_login(
-            username=principal(request)["username"],
-            session_id=principal(request).get("session_id", ""),
-            ticket=str(form.get("ticket", "")),
-        )
+        snapshot = qr_workspace_snapshot(request, str(form.get("ticket", "")))
+        if snapshot is None:
+            return qr_workspace_lost()
+        current, ticket = snapshot
+        renewed = heartbeat_login(username=current["username"], session_id=current.get("session_id", ""), ticket=ticket)
+        if not renewed:
+            return qr_workspace_lost()
         try:
-            payload = call_login_desktop("/refresh-qr", method="POST", payload={}, timeout=90)
-            return JSONResponse({"ok": True, "result": payload, "workspace": _workspace_payload(request)})
+            status, payload = await asyncio.to_thread(
+                call_login_desktop_json,
+                "/refresh-qr",
+                method="POST",
+                payload={"interaction_key": ticket},
+                timeout=90,
+            )
         except RuntimeError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+            if not qr_workspace_current(request, current, ticket):
+                return qr_workspace_lost()
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "state": "qr_service_unavailable",
+                    "error": str(exc),
+                    "message": "登录桌面服务暂时不可用，请稍后重试",
+                    "retryable": True,
+                    "retry_after": 3,
+                },
+                status_code=503,
+                headers={"Retry-After": "3", "Cache-Control": "no-store"},
+            )
+        if not qr_workspace_current(request, current, ticket) or status == 423:
+            return qr_workspace_lost()
+        if status >= 400 or not payload.get("ok", False):
+            # 202-qr_not_ready and any ok:false payload are real failures; the UI
+            # must not report a successful refresh when no QR code was produced.
+            message = str(payload.get("message") or payload.get("error") or "二维码尚未生成，请稍后重试")
+            delay = int(payload.get("retry_after") or 2)
+            return JSONResponse(
+                {
+                    **payload,
+                    "ok": False,
+                    "state": payload.get("state") or payload.get("code") or "qr_not_ready",
+                    "error": message,
+                    "message": message,
+                    "retryable": bool(payload.get("retryable", status == 503)),
+                    "retry_after": delay,
+                },
+                status_code=status if status >= 400 else 202,
+                headers={"Retry-After": str(delay), "Cache-Control": "no-store"},
+            )
+        return JSONResponse({"ok": True, "result": payload, "workspace": _workspace_payload(request)})
 
     @app.post("/login-desktop/focus")
     async def login_desktop_focus(request: Request):
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return JSONResponse({"redirect": "/login"}, status_code=401)
+        if principal(request)["role"] != "admin":
+            return JSONResponse({"error": "完整登录桌面仅供管理员使用。"}, status_code=403)
         lock_error = login_lock_required(request, api=True)
         if lock_error:
             return lock_error
@@ -1443,14 +4585,19 @@ def create_app():
         maybe_redirect = require_user(request)
         if maybe_redirect:
             return JSONResponse({"redirect": "/login"}, status_code=401)
+        current = principal(request)
+        if current.get("role") != "admin":
+            lock_error = login_lock_required(request, api=True)
+            if lock_error:
+                return lock_error
         await _expire_login_workspace()
         try:
             payload = call_login_desktop("/status")
-            payload["public_url"] = login_desktop_public_url(request)
+            payload["public_url"] = controlled_login_desktop_url(request)
             payload["workspace"] = _workspace_payload(request)
             return JSONResponse(payload)
         except RuntimeError as exc:
-            return JSONResponse({"ok": False, "error": str(exc), "public_url": login_desktop_public_url(request), "workspace": _workspace_payload(request)}, status_code=503)
+            return JSONResponse({"ok": False, "error": str(exc), "public_url": controlled_login_desktop_url(request), "workspace": _workspace_payload(request)}, status_code=503)
 
     @app.get("/login-desktop/workspace-status")
     async def login_desktop_workspace_status(request: Request):
@@ -1490,31 +4637,74 @@ def create_app():
         await _expire_login_workspace()
         current = principal(request)
         relogin_unique_id = str(form.get("relogin_unique_id", "")).strip()
+        relogin_account_ref = str(form.get("relogin_account_ref", "")).strip()
+        submitted_generation = str(form.get("login_generation", ""))
         requested_mode = str(form.get("mode", "")).strip().lower()
-        mode = requested_mode if requested_mode in {"add", "relogin"} else ("relogin" if relogin_unique_id else "add")
+        mode = requested_mode if requested_mode in {"add", "relogin"} else ("relogin" if (relogin_unique_id or relogin_account_ref) else "add")
         account_ref = ""
-        if relogin_unique_id:
-            _, account, access_error = account_for_request(request, relogin_unique_id)
+        lease_generation = ""
+        if relogin_unique_id or relogin_account_ref:
+            if not relogin_unique_id:
+                return JSONResponse({"ok": False, "error": "重新登录已有账号时必须选择账号"}, status_code=400)
+            _, account, access_error = account_for_request(
+                request,
+                relogin_unique_id,
+                account_ref=relogin_account_ref or None,
+                login_generation=submitted_generation,
+                require_generation_for_explicit_ref=True,
+                generation_present="login_generation" in form,
+            )
             if access_error:
                 return JSONResponse({"ok": False, "error": "无权操作该账号"}, status_code=access_error.status_code)
             account_ref = account.get("account_ref", "")
+            lease_generation = account_identity.account_login_generation(account)
             mode = "relogin"
         elif mode != "add":
             return JSONResponse({"ok": False, "error": "重新登录已有账号时必须选择账号"}, status_code=400)
+        if (
+            fingerprint_browser_enabled()
+            and mode == "relogin"
+            and not login_profile_continuity_enabled()
+        ):
+            return JSONResponse(
+                {"ok": False, "error": "指纹浏览器要求重新登录使用账号浏览器环境。"},
+                status_code=503,
+            )
 
         result = request_workspace(
             username=current["username"],
             session_id=current.get("session_id", ""),
             account_ref=account_ref,
+            login_generation=lease_generation,
             mode=mode,
         )
         if result["state"] == "full":
             return JSONResponse({"ok": False, "error": "登录排队人数已满，请稍后重试"}, status_code=429)
         if result["state"] == "queued":
             return JSONResponse({"ok": True, "state": "queued", "workspace": _workspace_payload(request)}, status_code=202)
+        if result["state"] == "conflict":
+            current_request = result.get("request") or {}
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "当前工作区正在用于另一登录上下文；请先恢复或关闭当前工作区后再切换账号。",
+                    "workspace": _workspace_payload(request),
+                    "current_workspace": {
+                        "state": result.get("current_state", ""),
+                        "mode": current_request.get("mode", ""),
+                        "account_ref": current_request.get("account_ref", ""),
+                        "login_generation": current_request.get("login_generation", ""),
+                    },
+                },
+                status_code=409,
+            )
         try:
-            call_login_desktop("/open-login", method="POST", payload={}, timeout=90)
-            return JSONResponse({"ok": True, "state": "active", "public_url": login_desktop_public_url(request), "workspace": _workspace_payload(request)})
+            # Off the event loop: opening takes seconds and must not stall other requests.
+            async with login_transition_lock:
+                desktop = await open_login_for_lease(result["request"], current=current)
+                if not login_lock_owner(request)[2]:
+                    return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请"}, status_code=423)
+            return JSONResponse({"ok": True, "state": "active", "public_url": controlled_login_desktop_url(request), "workspace": _workspace_payload(request), "desktop": desktop})
         except RuntimeError as exc:
             begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=result["request"].get("ticket", ""), account_ref=account_ref)
             await _reset_and_promote()
@@ -1540,10 +4730,41 @@ def create_app():
                 ticket=active.get("ticket", ""),
                 account_ref=active.get("account_ref", ""),
             )
-            await _reset_and_promote()
+            _reset_and_promote_later()
         else:
             cancel_login_request(username=current["username"], session_id=current.get("session_id", ""))
         return JSONResponse({"ok": True, "workspace": _workspace_payload(request)})
+
+    @app.post("/login-desktop/release")
+    async def login_desktop_release(request: Request):
+        """Cancel this page's exact active lease or queued request.
+
+        Unlike /close this must never force-reset the shared workspace: an admin
+        tab closing is not an admin asking to reset everyone's session.
+        """
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+        current = principal(request)
+        if not current:
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        ticket = str(form.get("ticket", "")).strip()
+        if not ticket or not ticket.isascii() or len(ticket) > 128:
+            return JSONResponse({"ok": True, "released": False})
+        # Matching and removal happen together under the workspace mutex. A
+        # queued request can be promoted while its page-leave beacon is in
+        # flight, and an older ticket must never cancel its replacement.
+        kind, _ = cancel_login_request(
+            username=current["username"],
+            session_id=current.get("session_id", ""),
+            ticket=ticket,
+        )
+        if kind == "active":
+            await _reset_and_promote()
+        return JSONResponse({"ok": True, "released": kind in {"active", "queued"}, "cancelled": kind == "queued"})
 
     @app.post("/login-desktop/reset")
     async def login_desktop_reset(request: Request):
@@ -1565,6 +4786,295 @@ def create_app():
         await _reset_and_promote()
         return JSONResponse({"ok": True, "workspace": _workspace_payload(request)})
 
+    @app.post("/login-desktop/clear-state")
+    async def login_desktop_clear_state(request: Request):
+        """Drop the shared persistent-profile login state (used after cookie login)."""
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"redirect": "/login"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+        # Clearing the shared profile while another session owns (or is about to
+        # take) the login workspace would fight that session for the same browser.
+        current = principal(request)
+        if current.get("role") != "admin":
+            active = get_login_lock()
+            if not active or not owns_login_lock(
+                active,
+                username=current["username"],
+                session_id=current.get("session_id", ""),
+            ):
+                return JSONResponse(
+                    {"ok": False, "error": "登录工作区当前未由本会话占用"},
+                    status_code=423,
+                )
+        try:
+            payload = call_login_desktop("/clear-login-state", method="POST", payload={}, timeout=60)
+            return JSONResponse({"ok": True, "result": payload})
+        except RuntimeError as exc:
+            logger.warning("Clearing the shared login state failed: %s", exc)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+
+    @app.post("/accounts/cookies")
+    async def login_with_cookies(request: Request):
+        """Sign in by pasting an existing Cookie instead of scanning a QR code."""
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
+
+        current = principal(request)
+        raw_cookies = str(form.get("cookie_input", ""))
+        display_name = str(form.get("display_name", "")).strip()
+        relogin_unique_id = str(form.get("relogin_unique_id", "")).strip()
+        relogin_account_ref = str(form.get("relogin_account_ref", "")).strip()
+        relogin_generation = str(form.get("login_generation", "")).strip()
+
+        if relogin_account_ref:
+            _, account, access_error = account_for_request(
+                request, relogin_unique_id, account_ref=relogin_account_ref,
+                login_generation=relogin_generation,
+                require_generation_for_explicit_ref=True,
+                generation_present="login_generation" in form,
+            )
+        elif relogin_unique_id:
+            _, account, access_error = account_for_request(request, relogin_unique_id)
+        else:
+            account = access_error = None
+        if relogin_unique_id or relogin_account_ref:
+            if access_error:
+                return JSONResponse(
+                    {"ok": False, "error": "账号登录已更新，请重新打开页面。" if access_error.status_code == 409 else "无权操作该账号"},
+                    status_code=access_error.status_code,
+                )
+            relogin_account_ref = str(account.get("account_ref", ""))
+            relogin_unique_id = str(account.get("unique_id", ""))
+        # The operator-chosen target (from the form), kept apart from a target a
+        # one-time confirmation would introduce: a confirmation may never switch
+        # the explicit target to another account (issue #41 A5).
+        explicit_relogin_ref = relogin_account_ref
+
+        try:
+            cookies = parse_cookie_input(raw_cookies)
+            require_auth_cookies(cookies)
+        except CookieParseError as exc:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "category": getattr(exc, "category", "cookie_format_invalid"),
+                    "retryable": False,
+                },
+                status_code=400,
+            )
+
+        # Snapshot the store before the network identity check; the save refuses
+        # to write when the chosen record changed meanwhile (issue #41 A8).
+        expected_records = {
+            str(row.get("account_ref") or ""): account_identity.record_fingerprint(row)
+            for row in get_userData(force_reload=True)
+            if str(row.get("account_ref") or "").strip()
+        }
+
+        if cookie_verification_lock.locked():
+            return JSONResponse({"ok": False, "error": "正在验证另一个账号，请稍后重试。", "category": "verification_busy", "retryable": True}, status_code=429, headers={"Retry-After": "5"})
+        async with cookie_verification_lock:
+            verified, verification_reason, identity, verification_category = await verify_login_result(
+                {"cookies": cookies},
+                relogin_account_ref=relogin_account_ref,
+            )
+        if not verified:
+            # Reject without touching any account: the pasted state was not
+            # usable, or whose account it is could not be confirmed yet.
+            category = verification_category or CATEGORY_LOGIN_REQUIRED
+            logger.warning(
+                "Cookie login rejected for user=%s category=%s reason=%s",
+                current.get("username", ""),
+                category,
+                verification_reason,
+            )
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": verification_reason or "Cookie 验证失败",
+                    "category": category,
+                    "categoryLabel": identity_category_label(category),
+                    # A transport, page or identity-endpoint problem is worth
+                    # retrying; a rejected Cookie is not.
+                    "retryable": category != CATEGORY_LOGIN_REQUIRED,
+                },
+                status_code=400,
+            )
+
+        trusted = dict(identity.get("trusted") or {})
+        uid = trusted.get("uid", "")
+        display_id = identity.get("display_id", "")
+        confirmation = None
+        confirm_token = str(form.get("confirm_identity", "")).strip()
+        if confirm_token:
+            record, problem = _take_identity_confirmation(confirm_token, current, "cookies")
+            if not record:
+                return JSONResponse({"ok": False, "error": problem, "category": "identity_confirmation_invalid"}, status_code=409)
+            confirmed_account = account_by_ref(get_userData(force_reload=True), record["account_ref"])
+            if not confirmed_account or not may_claim_account(current, confirmed_account):
+                return JSONResponse({"ok": False, "error": "无权操作该账号"}, status_code=403)
+            if explicit_relogin_ref and explicit_relogin_ref != record["account_ref"]:
+                # The confirmation is for a different account than the one the
+                # operator explicitly chose; never repoint the target silently.
+                return JSONResponse(
+                    {"ok": False, "error": "确认的账号与本次重新登录的账号不一致"},
+                    status_code=409,
+                )
+            relogin_account_ref = record["account_ref"]
+            confirmation = {
+                "account_ref": record["account_ref"],
+                "fingerprint": record["fingerprint"],
+                "uid": record["uid"],
+                "candidate_fingerprint": record.get("candidate_fingerprint", ""),
+                "confirmed_by": current.get("username", ""),
+            }
+
+        auto_matched = False
+        if not relogin_account_ref and uid:
+            saved_accounts = get_userData(force_reload=True)
+            if identity_owned_by_other(saved_accounts, uid, current, display_id):
+                return JSONResponse(
+                    {"ok": False, "error": "这个抖音账号已经绑定给其他用户，不能覆盖"},
+                    status_code=403,
+                )
+            rows, kind = rows_for_identity(saved_accounts, uid, display_id)
+            existing = preferred_row(rows, current)
+            if existing:
+                if not can_access_account(current, existing):
+                    # No other row for this Douyin account is owned, so the user
+                    # who just proved control may claim this one in place.
+                    logger.info(
+                        "Cookie login adopts an unassigned account: platform_uid=%s account_ref=%s user=%s",
+                        uid,
+                        existing.get("account_ref", ""),
+                        current.get("username", ""),
+                    )
+                relogin_account_ref = str(existing.get("account_ref", ""))
+                auto_matched = kind == "legacy"
+
+        legacy_check = None
+        if relogin_account_ref:
+            saved_accounts = get_userData(force_reload=True)
+            target_row = account_by_ref(saved_accounts, relogin_account_ref)
+            if target_row and unique_id_owned_by_other(saved_accounts, target_row.get("unique_id"), current):
+                # Another user's row shares this record's key; the save's dedupe
+                # must never take it (or its ownership) away.
+                return JSONResponse(
+                    {"ok": False, "error": "这个抖音账号已经绑定给其他用户，不能覆盖"},
+                    status_code=403,
+                )
+            if target_row and not confirmation and not account_identity.account_uid(target_row):
+                legacy_check = await asyncio.to_thread(legacy_identity_check, target_row)
+
+        login_result = {
+            "username": identity.get("username", ""),
+            "display_id": display_id,
+            "cookies": cookies,
+            "cookie_source": "pasted",
+        }
+
+        def persist_cookie_login():
+            return save_exported_login_result(
+                login_result,
+                relogin_account_ref=relogin_account_ref,
+                display_name=display_name,
+                is_healthy=True,
+                identity=trusted,
+                legacy_check=legacy_check,
+                confirmation=confirmation,
+                auto_matched=auto_matched,
+                expected_records=expected_records,
+                principal_resolver=lambda: principal(request),
+                expected_principal=current,
+            )
+
+        claim = None
+        if current.get("role") == "user":
+            claim = lambda account: update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
+        try:
+            account, action = await asyncio.to_thread(
+                commit_login_binding,
+                persist_cookie_login,
+                update_accounts=update_user_data,
+                claim_callback=claim,
+                owner_username=current.get("username", ""),
+            )
+        except BindingCommitError as exc:
+            return JSONResponse({"ok": False, "error": str(exc), "binding_pending": exc.uncertain}, status_code=503)
+        except LoginSavePermissionDenied as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
+        except IDENTITY_SAVE_ERRORS as exc:
+            return _identity_error_response(exc, current, "cookies", display_id=display_id)
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+        summary = cookie_summary(cookies)
+        logger.info(
+            "Cookie login saved by user=%s action=%s cookies=%s auth=%s",
+            current.get("username", ""),
+            action,
+            summary["count"],
+            ",".join(summary["auth_names"]),
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "action": action,
+                "message": f"Cookie 登录成功，已{'更新' if action == 'updated' else '添加'}账号 {account.get('username', '')}（{account_identity.IDENTITY_STATE_LABELS['verified']}）",
+                "identityState": "verified",
+                "account": {
+                    "account_ref": account.get("account_ref"),
+                    "login_generation": account_identity.account_login_generation(account),
+                    "unique_id": account.get("unique_id"),
+                    "username": account.get("username"),
+                    "platform_uid": account.get(account_identity.FIELD_UID, ""),
+                    "display_id": account.get(account_identity.FIELD_DISPLAY_ID, ""),
+                    "enabled": account.get("enabled", True),
+                    "healthy": True,
+                },
+            }
+        )
+
+    async def checked_binding_operation(request, current, operation, *, status_code=200):
+        payload = operation.payload()
+        result = payload.get("result") or {}
+        account = result.get("account") or {}
+        candidates = list(result.get("duplicate_candidates") or [])
+        if result.get("duplicate_candidate"):
+            candidates.append(result["duplicate_candidate"])
+        confirmation = result.get("identity_confirmation") or {}
+        references = [row for row in [account, *candidates, confirmation] if row.get("account_ref")]
+        accounts = await asyncio.to_thread(get_userData, force_reload=True) if references else []
+        live = await run_auth_read(principal, request)
+        if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+            return JSONResponse({"ok": False, "error": "登录状态已变化，请重新登录。"}, status_code=401)
+        for row in references:
+            saved = account_by_ref(accounts, row["account_ref"])
+            permitted = may_claim_account(live, saved) if row is confirmation and saved else can_access_account(live, saved) if saved else False
+            if not permitted:
+                return JSONResponse({"ok": False, "error": "账号权限或归属已变化，请到账号页核对。"}, status_code=403)
+            if row is account and str(saved.get("login_generation") or "") != str(account.get("login_generation") or ""):
+                return JSONResponse({"ok": False, "error": "这个账号的登录已更新，请到账号页查看最新结果。", "binding_pending": True}, status_code=409)
+        return JSONResponse(payload, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+    @app.get("/login-desktop/save/status")
+    async def login_save_status(request: Request):
+        current = await run_auth_read(principal, request)
+        if not current:
+            return JSONResponse({"ok": False, "error": "请重新登录。"}, status_code=401)
+        operation = binding_operations.find(current, str(request.query_params.get("operation_id", "")))
+        if operation is None:
+            return JSONResponse({"ok": False, "error": "找不到这次保存记录；请先核对账号，再决定是否重试。", "binding_pending": True}, status_code=404)
+        return await checked_binding_operation(request, current, operation)
+
     @app.post("/login-desktop/save")
     async def login_desktop_save(request: Request):
         maybe_redirect = require_user(request)
@@ -1575,58 +5085,381 @@ def create_app():
             return JSONResponse({"ok": False, "error": "Invalid CSRF token"}, status_code=403)
 
         current = principal(request)
+        if not current:
+            return JSONResponse({"ok": False, "error": "登录状态已变化，请重新登录。", "binding_pending": False}, status_code=401)
+        asynchronous = str(form.get("async_save", "")) == "1"
+        operation_id = str(form.get("request_id", ""))
+        if asynchronous:
+            if not ID_PATTERN.fullmatch(operation_id):
+                return JSONResponse({"ok": False, "error": "保存请求已失效，请重新打开页面。", "binding_pending": False}, status_code=400)
+            existing_operation = binding_operations.find(current, operation_id)
+            if existing_operation:
+                if str(form.get("ticket", "")) != existing_operation.ticket:
+                    return JSONResponse({"ok": False, "error": "保存请求与工作区不一致。"}, status_code=409)
+                return await checked_binding_operation(request, current, existing_operation, status_code=202)
+            running = binding_operations.running(current)
+            if running:
+                return JSONResponse({"ok": False, "error": "上一笔保存仍在处理，请先检查它的结果。", "operation_id": running.operation_id,
+                                     "status_url": "/login-desktop/save/status?operation_id=" + running.operation_id,
+                                     "binding_pending": True}, status_code=409)
         active = get_login_lock()
         if not owns_login_lock(active, username=current["username"], session_id=current.get("session_id", "")):
             return JSONResponse({"ok": False, "error": "登录工作区已释放，请重新申请"}, status_code=423)
+        ticket = str(active.get("ticket") or "")
+        submitted_ticket = str(form.get("ticket") or "")
+        if not submitted_ticket.isascii() or len(submitted_ticket) > 128 or (shared and not submitted_ticket) or (submitted_ticket and not secrets.compare_digest(submitted_ticket, ticket)):
+            return JSONResponse({"ok": False, "error": "登录工作区已更新，请重新申请后再保存"}, status_code=423)
+        if login_save_lock.locked():
+            return JSONResponse({"ok": False, "error": "正在处理上一次保存，请稍候", "category": "login_save_in_progress", "retryable": True}, status_code=409)
+        if asynchronous:
+            async def save_operation(operation):
+                async with login_save_lock:
+                    return await _save_owned_login(request, form, current, active, ticket, receipt=operation)
+            try:
+                operation = binding_operations.start(current, operation_id, ticket, save_operation)
+            except RuntimeError:
+                return JSONResponse({"ok": False, "error": "保存请求较多，请稍后重试。", "binding_pending": False}, status_code=503, headers={"Retry-After": "3"})
+            return binding_operations.response(operation)
+        async with login_save_lock:
+            return await _save_owned_login(request, form, current, active, ticket)
+
+    async def _save_owned_login(request, form, current, active, ticket, *, receipt=None):
+        class WorkspaceChanged(RuntimeError):
+            pass
+
+        def principal_for_save():
+            live = principal(request)
+            held = get_login_lock()
+            if not live or any(live.get(key) != current.get(key) for key in ("username", "role", "session_id")):
+                raise WorkspaceChanged("登录会话已变化，请重新登录")
+            if not owns_login_lock(held, username=current["username"], session_id=current.get("session_id", "")) or not secrets.compare_digest(str((held or {}).get("ticket") or ""), ticket):
+                raise WorkspaceChanged("登录工作区已释放，请重新申请")
+            if str((held or {}).get("account_ref") or "") != lease_account_ref:
+                raise WorkspaceChanged("登录目标已变化，请重新打开页面")
+            if lease_account_ref and (
+                "login_generation" not in (held or {})
+                or str((held or {}).get("login_generation", "")) != lease_generation
+            ):
+                raise WorkspaceChanged("账号登录已更新，请重新打开页面")
+            return live
+
         relogin_unique_id = str(form.get("relogin_unique_id", "")).strip()
+        submitted_ref = str(form.get("relogin_account_ref", "")).strip()
+        submitted_generation = str(form.get("login_generation", "")).strip()
         display_name = str(form.get("display_name", "")).strip()
         operation = str(active.get("mode", "relogin"))
-        relogin_account_ref = str(active.get("account_ref", ""))
+        lease_account_ref = str(active.get("account_ref") or "")
+        relogin_account_ref = lease_account_ref
+        lease_has_generation = "login_generation" in active
+        lease_generation = str(active.get("login_generation", ""))
+        if submitted_ref and submitted_ref != relogin_account_ref:
+            return JSONResponse({"ok": False, "error": "登录目标已变化，请重新打开页面。"}, status_code=409)
         if relogin_account_ref:
             account = account_by_ref(get_userData(force_reload=True), relogin_account_ref)
             if not account or not can_access_account(current, account):
                 return JSONResponse({"ok": False, "error": "无权操作该账号"}, status_code=403)
+            if not lease_has_generation or account_identity.account_login_generation(account) != lease_generation:
+                return JSONResponse({"ok": False, "error": "账号登录已更新，请重新打开页面。"}, status_code=409)
+            if submitted_ref and ("login_generation" not in form or account_identity.account_login_generation(account) != submitted_generation):
+                return JSONResponse({"ok": False, "error": "账号登录已更新，请重新打开页面。"}, status_code=409)
             relogin_unique_id = account.get("unique_id", "")
             operation = "relogin"
         elif operation != "add" and current.get("role") != "admin":
             return JSONResponse({"ok": False, "error": "普通用户必须选择自己的抖音账号"}, status_code=400)
+        # Snapshot the store before the export and the identity check: the save
+        # refuses to write when the chosen record changed meanwhile (A8).
+        expected_records = {
+            str(row.get("account_ref") or ""): account_identity.record_fingerprint(row)
+            for row in get_userData(force_reload=True)
+            if str(row.get("account_ref") or "").strip()
+        }
         try:
-            payload = call_login_desktop("/export", method="POST", payload={}, timeout=30)
+            # Off the event loop: exporting reads the live login page and must not
+            # freeze every other request (noVNC, heartbeats) while it runs.
+            principal_for_save()
+            if receipt is not None:
+                receipt.set_stage("exporting")
+            payload = await asyncio.to_thread(call_login_desktop, "/export", method="POST", payload={"interaction_key": ticket}, timeout=30)
+            principal_for_save()
             if not payload.get("ok"):
                 raise RuntimeError("login-desktop export did not return ok")
             exported = payload.get("result", {}) or {}
-            existing = account_by_unique_id(get_userData(force_reload=True), exported.get("unique_id"))
-            if existing and str(existing.get("account_ref", "")) != relogin_account_ref and not can_access_account(current, existing):
+            display_id = account_identity.display_id_from_text(
+                exported.get("display_id") or ""
+            )
+            # The page-read ID may be the public handle or the platform UID;
+            # only the authenticated self-identity response decides who this is.
+            if receipt is not None:
+                receipt.set_stage("checking_identity")
+            try:
+                trusted = await asyncio.to_thread(
+                    account_identity.fetch_trusted_identity,
+                    list(exported.get("cookies") or []),
+                )
+            except account_identity.IdentityUnavailable as exc:
+                # Keep the workspace: the operator can retry the save.
+                principal_for_save()
+                return _identity_error_response(exc, current, "login-desktop", display_id=display_id)
+            principal_for_save()
+            uid = trusted["uid"]
+            rows, match_kind = rows_for_identity(
+                get_userData(force_reload=True), uid, display_id
+            )
+            existing = preferred_row(rows, current)
+            confirmation = None
+            confirm_adopts = False
+            confirm_token = str(form.get("confirm_identity", "")).strip()
+            if confirm_token:
+                record, problem = _take_identity_confirmation(confirm_token, current, "login-desktop")
+                if not record:
+                    return JSONResponse({"ok": False, "error": problem, "category": "identity_confirmation_invalid"}, status_code=409)
+                candidate = account_by_ref(get_userData(force_reload=True), record["account_ref"])
+                if not candidate or not may_claim_account(current, candidate):
+                    return JSONResponse({"ok": False, "error": "无权操作该账号"}, status_code=403)
+                confirm_adopts = not can_access_account(current, candidate)
+                if relogin_account_ref and relogin_account_ref != record["account_ref"]:
+                    return JSONResponse({"ok": False, "error": "确认的账号与本次重新登录的账号不一致"}, status_code=409)
+                existing = candidate
+                relogin_account_ref = record["account_ref"]
+                relogin_unique_id = candidate.get("unique_id", "")
+                operation = "relogin"
+                confirmation = {
+                    "account_ref": record["account_ref"],
+                    "fingerprint": record["fingerprint"],
+                    "uid": record["uid"],
+                    "candidate_fingerprint": record.get("candidate_fingerprint", ""),
+                    "confirmed_by": current.get("username", ""),
+                }
+            merge_with = str(form.get("merge_with", "")).strip()
+            if merge_with and not confirmation:
+                # The operator confirmed that a same-name account is the one they
+                # are re-logging into, so update it instead of adding a duplicate.
+                candidate = account_by_ref(get_userData(force_reload=True), merge_with)
+                if candidate and can_access_account(current, candidate):
+                    existing = candidate
+                    relogin_account_ref = candidate.get("account_ref", "")
+                    relogin_unique_id = candidate.get("unique_id", "")
+                    operation = "relogin"
+            # Read once, before the guard below: the audit line has to stay
+            # reachable, and inside the guard `allow_duplicate == "1"` is always
+            # false, which made the first version of this log dead code.
+            allow_duplicate_requested = (
+                str(form.get("allow_duplicate", "")).strip() == "1"
+            )
+            if allow_duplicate_requested and not existing:
+                logger.info(
+                    "Login save creates a separate account past a same-name match: platform_uid=%s",
+                    uid,
+                )
+            # A chosen re-login target means the operator already picked which
+            # account this login belongs to; it is still only written when the
+            # identity check agrees.
+            relogin_target_given = bool(
+                str(form.get("relogin_unique_id", "")).strip() or merge_with or confirmation
+            )
+            if (
+                not existing
+                and not allow_duplicate_requested
+                and not relogin_target_given
+            ):
+                # No account matched this login, so creating a row is the only
+                # remaining outcome. Ask first if the nickname already exists:
+                # the operator may be re-logging into a legacy record.
+                # Fall back to the displayed ID when the export carries no
+                # nickname, otherwise an empty name silently skips the check.
+                exported_name = str(
+                    exported.get("username") or display_id or ""
+                ).strip()
+                same_name = [
+                    item
+                    for item in find_same_name_account(
+                        get_userData(force_reload=True), exported_name
+                    )
+                    if can_access_account(current, item)
+                ]
+                if same_name:
+                    duplicate = same_name[0]
+                    logger.info(
+                        "Login save paused for confirmation: platform_uid=%s candidates=%s",
+                        uid,
+                        len(same_name),
+                    )
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "error": "已有同名账号，请确认是更新它还是新建",
+                            "duplicate_candidate": {
+                                "account_ref": duplicate.get("account_ref", ""),
+                                "username": duplicate.get("username", ""),
+                                "unique_id": duplicate.get("unique_id", ""),
+                            },
+                            # More than one candidate means the console cannot
+                            # guess which row the operator means; the frontend
+                            # refuses instead of merging into the wrong account.
+                            "duplicate_candidates": [
+                                {
+                                    "account_ref": item.get("account_ref", ""),
+                                    "username": item.get("username", ""),
+                                    "unique_id": item.get("unique_id", ""),
+                                }
+                                for item in same_name
+                            ],
+                        },
+                        status_code=409,
+                    )
+            # Confirming an unassigned legacy row claims it, like adopting it.
+            adopt_unassigned = confirm_adopts
+            if not relogin_account_ref and identity_owned_by_other(
+                get_userData(force_reload=True), uid, current, display_id
+            ):
                 raise RuntimeError("这个抖音账号已经绑定给其他用户，不能覆盖")
+            if existing and str(existing.get("account_ref", "")) != relogin_account_ref and not can_access_account(current, existing):
+                # No other row for this Douyin account is owned, so the operator
+                # who just proved control may claim this unassigned row in place.
+                adopt_unassigned = True
+                logger.info(
+                    "Login save adopts an unassigned account: platform_uid=%s account_ref=%s user=%s",
+                    uid,
+                    existing.get("account_ref", ""),
+                    current.get("username", ""),
+                )
             if operation == "add" and current.get("role") == "user" and existing:
                 relogin_account_ref = existing.get("account_ref", "")
                 relogin_unique_id = existing.get("unique_id", "")
                 operation = "relogin"
-            account, action = save_exported_login_result(
-                exported,
-                relogin_unique_id=relogin_unique_id,
-                relogin_account_ref=relogin_account_ref,
-                display_name=display_name,
+            # A row found only by a matching ID (not chosen by the operator) is
+            # written only once a legacy row is proven or confirmed; if its own
+            # cookies prove it is someone else, the login becomes a new account.
+            auto_matched = bool(existing) and not relogin_target_given and match_kind == "legacy"
+            if existing and not relogin_account_ref:
+                relogin_account_ref = existing.get("account_ref", "")
+            legacy_check = None
+            if relogin_account_ref:
+                saved_accounts = get_userData(force_reload=True)
+                target_row = account_by_ref(saved_accounts, relogin_account_ref)
+                if target_row and unique_id_owned_by_other(saved_accounts, target_row.get("unique_id"), current):
+                    raise RuntimeError("这个抖音账号已经绑定给其他用户，不能覆盖")
+                if target_row and not confirmation and not account_identity.account_uid(target_row):
+                    legacy_check = await asyncio.to_thread(legacy_identity_check, target_row)
+                    principal_for_save()
+            # Only the instant checks run here. Re-reading the login state in a
+            # second browser took minutes on this host, so it runs after the
+            # save, in the background (D12); the account shows "verifying".
+            verification_reason, verification_category = "", ""
+            try:
+                require_auth_cookies(list(exported.get("cookies") or []))
+                verified = None
+            except CookieParseError as exc:
+                verified = False
+                verification_reason = str(exc)
+                verification_category = getattr(exc, "category", "cookie_format_invalid")
+            verification_token = uuid.uuid4().hex if verified is None else ""
+
+            def persist_workspace_login():
+                return save_exported_login_result(
+                    exported,
+                    relogin_unique_id=relogin_unique_id,
+                    relogin_account_ref=relogin_account_ref,
+                    display_name=display_name,
+                    is_healthy=verified,
+                    verification_reason=verification_reason,
+                    verification_category=verification_category,
+                    verification_token=verification_token,
+                    identity=trusted,
+                    legacy_check=legacy_check,
+                    confirmation=confirmation,
+                    auto_matched=auto_matched,
+                    expected_records=expected_records,
+                    principal_resolver=principal_for_save,
+                    expected_principal=current,
+                )
+
+            claim = None
+            if current.get("role") == "user":
+                claim = lambda account: update_web_user(current["username"], append_account_ref=account.get("account_ref", ""))
+            try:
+                if receipt is not None:
+                    receipt.begin_write()
+                account, action = await asyncio.to_thread(
+                    commit_login_binding,
+                    persist_workspace_login,
+                    update_accounts=update_user_data,
+                    claim_callback=claim,
+                    owner_username=current.get("username", ""),
+                )
+            except BindingCommitError as exc:
+                logger.error("Workspace binding commit failed; uncertain=%s cause=%s", exc.uncertain, type(exc.__cause__).__name__, exc_info=True)
+                return JSONResponse({"ok": False, "error": str(exc), "binding_pending": exc.uncertain}, status_code=503)
+            except LoginSavePermissionDenied as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
+            except IDENTITY_SAVE_ERRORS as exc:
+                # Nothing was written and the workspace is kept for a retry.
+                return _identity_error_response(exc, current, "login-desktop", display_id=display_id)
+            if receipt is not None:
+                receipt.record_saved(account, action)
+            normalized_saved = normalize_unique_id(account.get("unique_id"))
+            friend_refresh_state = "queued" if verified is None else "skipped"
+            # Without this trail a wrong match is invisible: a duplicate account
+            # only shows up later as two same-name rows in the list.
+            logger.info(
+                "Login save: platform_uid=%s name_len=%s requested_uid=%s operation=%s action=%s verified=%s matched_before=%s",
+                uid,
+                len(str(exported.get("username") or "")),
+                normalize_unique_id(relogin_unique_id) or "",
+                operation,
+                action,
+                verified,
+                bool(existing),
             )
-            if operation == "add" and current.get("role") == "user":
-                refs = list(dict.fromkeys(list(current.get("account_refs", [])) + [account.get("account_ref", "")]))
-                update_web_user(current["username"], account_refs=refs)
-            begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=active.get("ticket", ""), account_ref=active.get("account_ref", ""))
-            await _reset_and_promote()
+            released = begin_login_release(username=current["username"], session_id=current.get("session_id", ""), ticket=ticket, account_ref=active.get("account_ref", ""))
+            # The account is saved; do not hold the answer until the login
+            # browser is reset and reopened for whoever is queued next.
+            if released:
+                _reset_and_promote_later()
+            if verification_token:
+                _queue_login_verification(
+                    account.get("account_ref", ""),
+                    verification_token,
+                    account_identity.account_login_generation(account),
+                )
             return JSONResponse({
                 "ok": True,
                 "action": action,
+                "verified": verified,
+                "verification": "pending" if verified is None else ("passed" if verified else "failed"),
+                "verification_error": verification_reason,
+                "verification_category": verification_category,
+                "friend_refresh": friend_refresh_state,
+                "identityState": "verified",
+                "identityLabel": account_identity.IDENTITY_STATE_LABELS["verified"],
                 "account": {
                     "account_ref": account.get("account_ref"),
+                    "login_generation": account_identity.account_login_generation(account),
                     "unique_id": account.get("unique_id"),
                     "username": account.get("username"),
+                    "platform_uid": account.get(account_identity.FIELD_UID, ""),
+                    "display_id": account.get(account_identity.FIELD_DISPLAY_ID, ""),
                     "enabled": account.get("enabled", True),
+                    "healthy": bool(verified),
                 },
                 "workspace": _workspace_payload(request),
             })
+        except WorkspaceChanged as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=423)
         except RuntimeError as exc:
+            try:
+                principal_for_save()
+            except WorkspaceChanged as changed:
+                return JSONResponse({"ok": False, "error": str(changed)}, status_code=423)
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
+    register_login_interaction_routes(
+        app, principal=principal, owner=login_lock_owner, expire=_expire_login_workspace,
+        csrf_valid=validate_csrf, call_desktop=lambda *args, **kwargs: call_login_desktop_json(*args, **kwargs),
+    )
+    register_registration_routes(app, render_template, flash, login_throttle, secure_cookie)
+    register_personal_streak_routes(app, principal=principal, csrf_valid=validate_csrf, render=render_template, flash=flash)
+    register_account_binding_routes(app, principal=principal, read_accounts=lambda **kwargs: get_userData(**kwargs))
     return app
 
 

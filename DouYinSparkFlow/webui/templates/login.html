@@ -1,83 +1,111 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+{% from "_auth-icons.html" import icon %}
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark light">
-    <title>登录 | 续火花控制台</title>
-    <link rel="stylesheet" href="/static/app.css?v=20260710">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cut">
+    <meta name="color-scheme" content="light dark">
+    <title>登录 · 续火花</title>
+    <script>
+      (function () {
+        var stored = null;
+        try { stored = localStorage.getItem("sparkflow-theme"); } catch (e) {}
+        document.documentElement.dataset.theme = stored === "light" || stored === "dark"
+          ? stored
+          : (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      })();
+    </script>
+    {% include "_auth-style.html" %}
+    {% include "_auth-icon-license.html" %}
   </head>
-  <body class="login-page">
-    <aside class="login-brand-panel">
-      <a class="brand" href="/login">
-        <span class="brand-mark"><i data-lucide="flame"></i></span>
-        <span>
-          <strong class="brand-title">续火花</strong>
-          <small class="brand-subtitle">多账号控制平台</small>
-        </span>
-      </a>
+  <body data-page="login" data-auth-theme>
+    <div class="auth">
+      <aside class="auth-story">
+        <a class="brand" href="/login">
+          <span class="brand-mark">{{ icon('flame') }}</span>
+          <span>续火花<small>SparkFlow</small></span>
+        </a>
+        <div>
+          <h1>每天一句问候，<br><span>火花不再断。</span></h1>
+          <p>多个抖音账号的续火花都在这里：按时自动发送、确认每一条是否送达、异常的一键补发。</p>
+          <ul class="auth-features">
+            <li>{{ icon('calendar-clock') }}<span>发送窗口内分批发送，结束后自动兜底补发</span></li>
+            <li>{{ icon('badge-check') }}<span>服务端回执强确认，弱证据单独标出</span></li>
+            <li>{{ icon('scan-qr-code') }}<span>网页里扫码登录，手机也能直接操作</span></li>
+          </ul>
+        </div>
+        <small class="muted">DouYin Spark Flow</small>
+      </aside>
 
-      <div class="login-brand-copy">
-        <h1>让每个好友<br><span>都不再断火花</span></h1>
-        <p>集中查看多账号发送进度、异常目标和登录状态，在一个控制台完成续火花运维。</p>
-        <ul class="login-features">
-          <li><i data-lucide="calendar-clock"></i><span>分时调度与当日未发送兜底</span></li>
-          <li><i data-lucide="badge-check"></i><span>服务端回执与强确认账本</span></li>
-          <li><i data-lucide="scan-line"></i><span>网页内扫码登录与登录态同步</span></li>
-        </ul>
-      </div>
-
-      <small class="muted">DouYin Spark Flow · Admin Console</small>
-    </aside>
-
-    <main class="login-form-panel">
-      <section class="login-card">
-        <h2>{% if bootstrapped %}控制台登录{% else %}初始化管理员{% endif %}</h2>
-        <p>登录后可管理账号、目标好友、发送任务与运维配置。</p>
-
-        {% if flash %}
-        <div class="flash flash-{{ flash.level }}" role="status">{{ flash.message }}</div>
-        {% endif %}
-
-        {% if not bootstrapped %}
-        <form method="post" action="/bootstrap" class="stack-form">
-          <label>
-            <span>管理员用户名</span>
-            <input type="text" name="username" value="admin" autocomplete="username">
-          </label>
-          <label>
-            <span>管理员密码</span>
-            <input type="password" name="password" autocomplete="new-password">
-          </label>
-          <label>
-            <span>确认密码</span>
-            <input type="password" name="confirm_password" autocomplete="new-password">
-          </label>
-          <button class="button button-primary button-block" type="submit">
-            <i data-lucide="shield-check"></i><span>初始化管理员账号</span>
+      <main class="auth-main">
+        <div class="auth-tools">
+          <button class="icon-button" type="button" data-theme-toggle aria-label="切换深浅色" title="切换深浅色">
+            {{ icon('moon', 'theme-light-icon') }}
+            {{ icon('sun', 'theme-dark-icon') }}
           </button>
-        </form>
-        {% else %}
-        <form method="post" action="/login" class="stack-form">
-          <label>
-            <span>管理员用户名</span>
-            <input type="text" name="username" value="admin" autocomplete="username">
-          </label>
-          <label>
-            <span>管理员密码</span>
-            <input type="password" name="password" autocomplete="current-password">
-          </label>
-          <button class="button button-primary button-block" type="submit">
-            <i data-lucide="log-in"></i><span>登录控制台</span>
-          </button>
-        </form>
-        {% endif %}
+        </div>
+        <section class="auth-card">
+          <h2>{% if bootstrapped %}欢迎回来{% else %}先创建管理员{% endif %}</h2>
+          <p>{% if bootstrapped %}用管理员或普通用户的账号登录控制台。{% else %}第一次使用，设置一个管理员账号和密码。{% endif %}</p>
 
-        <div class="login-foot">认证页面不会展示服务器凭据或登录态数据。</div>
-      </section>
-    </main>
+          {% if flash %}
+          <div class="flash flash-{{ flash.level }}" role="status">{{ flash.message }}</div>
+          {% endif %}
 
-    <script defer src="/static/lucide.min.js?v=20260710"></script>
-    <script defer src="/static/app.js?v=20260710"></script>
+          {% if not bootstrapped %}
+          <form method="post" action="/bootstrap" class="form-stack" data-auth-form>
+            {% if bootstrap_token_required %}
+            <label class="field"><span>初始化密钥</span><input type="password" name="bootstrap_token" autocomplete="off" required><small>由服务器管理员提供，仅用于首次创建管理员。</small></label>
+            {% endif %}
+            <label class="field">
+              <span>管理员用户名</span>
+              <input type="text" name="username" value="admin" autocomplete="username">
+            </label>
+            <label class="field">
+              <span>密码</span>
+              <input type="password" name="password" autocomplete="new-password" minlength="10" title="至少 10 位，包含字母、数字、符号中的至少两种">
+            </label>
+            <label class="field">
+              <span>确认密码</span>
+              <input type="password" name="confirm_password" autocomplete="new-password">
+            </label>
+            <button class="button button-primary button-block" type="submit">
+              {{ icon('shield-check') }}<span>创建管理员</span>
+            </button>
+          </form>
+          {% else %}
+          <form method="post" action="/login" class="form-stack" data-auth-form>
+            <input type="hidden" name="csrf_token" value="{{ login_csrf }}">
+            <label class="field">
+              <span>用户名</span>
+              <input type="text" name="username" autocomplete="username" maxlength="64" value="{{ login_username or '' }}" autofocus required>
+            </label>
+            <label class="field">
+              <span>密码</span>
+              <input type="password" name="password" autocomplete="current-password" maxlength="1024" required>
+            </label>
+            <button class="button button-primary button-block" type="submit">
+              {{ icon('log-in') }}<span>登录</span>
+            </button>
+          </form>
+          {% endif %}
+
+          {% if bootstrapped and passkeys_enabled %}
+          <div data-passkey-panel>
+            <button type="button" class="button button-quiet button-block" data-passkey-login>{{ icon('fingerprint') }}<span>使用通行密钥登录</span></button>
+            <p class="notice-inline" data-passkey-status role="status" aria-live="polite">填写用户名后，用已绑定的设备验证。</p>
+          </div>
+          {% endif %}
+          {% if bootstrapped and registration_available %}<p class="auth-foot"><a href="/register">还没有账号？创建普通用户</a></p>{% endif %}
+          {% if bootstrapped %}<p class="auth-foot">忘记密码或尚未通过审核，请联系管理员。</p>{% endif %}
+          <p class="auth-foot">登录页不会展示服务器凭据或任何登录态数据。</p>
+        </section>
+      </main>
+    </div>
+
+    {% if bootstrapped and passkeys_enabled %}
+    <script defer src="{{ asset_url('passkeys.js') }}"></script>
+    {% endif %}
+    <script defer src="{{ asset_url('auth-forms.js') }}"></script>
   </body>
 </html>

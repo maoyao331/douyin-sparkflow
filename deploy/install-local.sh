@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -38,7 +39,11 @@ if [ -n "$proxy_sub_url" ]; then
   set_env_value ".env" "PROXY_SUB_URL" "$proxy_sub_url"
 fi
 
-mkdir -p proxy state/cron state/login-profile state/browser-profiles DouYinSparkFlow/logs
+# Validate without printing the resolved configuration, which may contain secrets.
+docker compose config --quiet
+docker info >/dev/null
+
+mkdir -p proxy state/cron state/login-api state/login-profile state/browser-profiles DouYinSparkFlow/logs
 if [ ! -f "proxy/config.yaml" ]; then
   cp "proxy/config.example.yaml" "proxy/config.yaml"
 fi
